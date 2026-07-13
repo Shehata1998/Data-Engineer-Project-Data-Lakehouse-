@@ -1,0 +1,91 @@
+"""
+Download warehouse_master.csv from Google Sheets
+────────────────────────────────────────────────────
+- Downloads CSV export of a Google Sheet (public "Anyone with the link" access)
+- If file already exists → delete it first then re-download
+- No API key needed
+"""
+ 
+import os
+import logging
+import requests
+from pathlib import Path
+ 
+log = logging.getLogger(__name__)
+ 
+# ── Google Sheet source ──────────────────────────────────────────────
+# Sheet URL: https://docs.google.com/spreadsheets/d/1s2juDAPHqjwXu5WiUbnrjWY_Fpw51i1DpB9ZQ0i9EFc/edit?usp=sharing
+GOOGLE_SHEET_ID       = "1s2juDAPHqjwXu5WiUbnrjWY_Fpw51i1DpB9ZQ0i9EFc"
+# NOTE: this sheet's first-tab gid is NOT 0 (passing gid=0 causes a 400 error).
+# Leaving gid unset defaults to the first tab. If you need a specific tab later,
+# open that tab in the browser and copy the real gid= value from the URL.
+GOOGLE_SHEET_GID      = None
+WAREHOUSE_MASTER_PATH = "/opt/airflow/data/warehouse_master.csv"
+ 
+ 
+def download_warehouse_master() -> str:
+ 
+    log.info("🔄 Downloading warehouse_master.csv from Google Sheets ...")
+ 
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    os.system("chmod -R 777 /opt/airflow/data")
+    log.info("🔑 Permissions fixed on /opt/airflow/data")
+ 
+    if Path(WAREHOUSE_MASTER_PATH).exists():
+        Path(WAREHOUSE_MASTER_PATH).unlink()
+        log.info("🗑️  Old file removed → downloading latest version")
+ 
+    session = requests.Session()
+ 
+    export_url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv"
+    if GOOGLE_SHEET_GID:
+        export_url += f"&gid={GOOGLE_SHEET_GID}"
+ 
+    log.info(f"🔗 Fetching: {export_url}")
+    response = session.get(export_url, stream=True, timeout=60)
+ 
+    if response.status_code != 200:
+        raise ConnectionError(
+            f"❌ Failed to download warehouse_master.csv. Status code: {response.status_code}\n"
+            f"   تأكد إن الـ Google Sheet مشارك على 'Anyone with the link can view'.\n"
+            f"   Sheet ID: {GOOGLE_SHEET_ID} | gid: {GOOGLE_SHEET_GID or 'default (first tab)'}"
+        )
+ 
+    content_type = response.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        raise PermissionError(
+            "❌ Google Sheets returned an HTML page instead of the CSV export.\n"
+            "   Make sure sharing is set to 'Anyone with the link can view'.\n"
+            f"   Sheet ID: {GOOGLE_SHEET_ID}"
+        )
+ 
+    with open(WAREHOUSE_MASTER_PATH, "wb") as f:
+        for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+ 
+    # تحقق إن الملف مش HTML مخبّي / فاضي
+    file_size = Path(WAREHOUSE_MASTER_PATH).stat().st_size
+    if file_size < 50:
+        Path(WAREHOUSE_MASTER_PATH).unlink(missing_ok=True)
+        raise ConnectionError(f"❌ Downloaded file too small ({file_size} bytes) — download failed.")
+ 
+    with open(WAREHOUSE_MASTER_PATH, "r", encoding="utf-8-sig", errors="replace") as f:
+        first_line = f.readline(500)
+    if first_line.strip().lower().startswith("<!doctype") or "<html" in first_line.lower():
+        Path(WAREHOUSE_MASTER_PATH).unlink(missing_ok=True)
+        raise PermissionError(
+            "❌ Downloaded file is HTML, not CSV.\n"
+            "   Make sure the Google Sheet is shared publicly ('Anyone with the link')."
+        )
+ 
+    os.system(f"chmod 777 {WAREHOUSE_MASTER_PATH}")
+    log.info(f"✅ warehouse_master.csv downloaded successfully")
+    log.info(f"📦 File size: {file_size:,} bytes")
+    log.info(f"📁 Path: {WAREHOUSE_MASTER_PATH}")
+    return WAREHOUSE_MASTER_PATH
+ 
+ 
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    download_warehouse_master()

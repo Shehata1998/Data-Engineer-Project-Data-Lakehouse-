@@ -1,0 +1,252 @@
+"""
+Build dim_customer
+──────────────────────────────────────────────────────────────────────
+PRIMARY KEY : customer_branch_code  (lowercase, no separator)
+  Format: customer_code + branchcd  (or from sales: cust_code + supplier_code)
+
+FOREIGN KEY references:
+  - fact_sales_lines.cust_branch_key
+  - fact_collection.cust_branch_key
+
+Strategy:
+  1. Start with ALL unique cust_branch_key from fact_sales_lines and fact_collection
+  2. Enrich with customer_name, customer_code, supplier_code, branchcd from Customer_Master
+  3. Any key not in Customer Master gets default values (customer_name = 'Unknown')
+  4. No orphan keys will exist in fact tables.
+"""
+
+import pandas as pd
+import logging
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+FACT_SALES_PATH           = "/opt/airflow/data/fact_sales_lines.csv"
+FACT_COLLECTION_PATH      = "/opt/airflow/data/fact_collection.csv"
+FACT_DEBTORS_PATH         = "/opt/airflow/data/fact_debtors_ageing.csv"
+FACT_COLLECTED_AGEING_PATH= "/opt/airflow/data/fact_collected_ageing.csv"
+CUSTOMER_MASTER_PATH      = "/opt/airflow/data/Customer_Master_Report.csv"
+DIM_CUSTOMER_PATH         = "/opt/airflow/data/dim_customer.csv"
+
+
+def _read_csv_safe(path: str) -> pd.DataFrame:
+    for enc in ('utf-8-sig', 'utf-8', 'latin-1'):
+        try:
+            df = pd.read_csv(path, dtype=str, encoding=enc, on_bad_lines="warn")
+            df.columns = df.columns.str.strip().str.lower()
+            return df
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot read {path}")
+
+
+def _clean_id(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().str.replace('.0', '', regex=False).fillna('')
+
+
+def build_dim_customer() -> tuple:
+
+    log.info("🔄 Building dim_customer (ensuring ALL cust_branch_key from facts exist)...")
+
+    # ── Source 1: fact_sales_lines (cust_branch_key) ──────────────────
+    if not Path(FACT_SALES_PATH).exists():
+        raise FileNotFoundError(f"❌ fact_sales_lines not found: {FACT_SALES_PATH}")
+
+    sales_df = _read_csv_safe(FACT_SALES_PATH)
+    if 'cust_branch_key' not in sales_df.columns:
+        raise ValueError("❌ 'cust_branch_key' column missing in fact_sales_lines")
+
+    sales_keys = sales_df['cust_branch_key'].dropna().astype(str).str.strip().unique()
+    log.info(f"📊 Source 1 (fact_sales_lines): {len(sales_keys):,} unique cust_branch_keys")
+
+    # ── Source 2: fact_collection (cust_branch_key) ───────────────────
+    collection_keys = []
+    if Path(FACT_COLLECTION_PATH).exists():
+        coll_df = _read_csv_safe(FACT_COLLECTION_PATH)
+        if 'cust_branch_key' in coll_df.columns:
+            collection_keys = coll_df['cust_branch_key'].dropna().astype(str).str.strip().unique()
+            log.info(f"📊 Source 2 (fact_collection): {len(collection_keys):,} unique cust_branch_keys")
+        else:
+            log.warning("⚠️ fact_collection has no 'cust_branch_key' column")
+    else:
+        log.warning("⚠️ fact_collection not found")
+
+    # ── Source 3: fact_debtors_ageing (cust_branch_key) ──────────────
+    # السبب: fact_debtors_ageing بيبني cust_branch_key من client_code + supplier_code
+    # وده ممكن يحتوي على عملاء مش موجودين في fact_sales_lines أو fact_collection
+    debtors_keys = []
+    if Path(FACT_DEBTORS_PATH).exists():
+        debt_df = _read_csv_safe(FACT_DEBTORS_PATH)
+        if 'cust_branch_key' in debt_df.columns:
+            debtors_keys = debt_df['cust_branch_key'].dropna().astype(str).str.strip().unique()
+            log.info(f"📊 Source 3 (fact_debtors_ageing): {len(debtors_keys):,} unique cust_branch_keys")
+        else:
+            log.warning("⚠️ fact_debtors_ageing has no 'cust_branch_key' column")
+    else:
+        log.warning("⚠️ fact_debtors_ageing not found — will be built before this step in DAG")
+
+    # ── Source 4: fact_collected_ageing (cust_branch_key) ────────────
+    # السبب: fact_collected_ageing بيبني cust_branch_key من vend_code + br_cd
+    # وده كمان مصدر مستقل ممكن يكون فيه عملاء جدد
+    collected_keys = []
+    if Path(FACT_COLLECTED_AGEING_PATH).exists():
+        col_age_df = _read_csv_safe(FACT_COLLECTED_AGEING_PATH)
+        if 'cust_branch_key' in col_age_df.columns:
+            collected_keys = col_age_df['cust_branch_key'].dropna().astype(str).str.strip().unique()
+            log.info(f"📊 Source 4 (fact_collected_ageing): {len(collected_keys):,} unique cust_branch_keys")
+        else:
+            log.warning("⚠️ fact_collected_ageing has no 'cust_branch_key' column")
+    else:
+        log.warning("⚠️ fact_collected_ageing not found — will be built before this step in DAG")
+
+    # Combine ALL keys from all 4 sources
+    all_keys = set(sales_keys)
+    if len(collection_keys) > 0:
+        all_keys.update(collection_keys)
+    if len(debtors_keys) > 0:
+        all_keys.update(debtors_keys)
+    if len(collected_keys) > 0:
+        all_keys.update(collected_keys)
+    dim = pd.DataFrame({'customer_branch_code': list(all_keys)})
+    log.info(f"📊 Total unique cust_branch_keys: {len(dim):,}")
+
+    # ── Source 3: Customer Master (enrichment) ────────────────────────
+    if not Path(CUSTOMER_MASTER_PATH).exists():
+        log.warning(f"⚠️ Customer Master not found: {CUSTOMER_MASTER_PATH}")
+        log.warning("   Using default values for customer_name, customer_code, supplier_code, branchcd")
+        dim['customer_code'] = dim['customer_branch_code']
+        dim['customer_name'] = 'Unknown'
+        dim['supplier_code'] = ''
+        dim['branchcd'] = ''
+    else:
+        master = _read_csv_safe(CUSTOMER_MASTER_PATH)
+        master_cols = master.columns.tolist()
+        log.info(f"📋 Customer Master columns: {master_cols}")
+
+        # Detect column names (case-insensitive)
+        def find_col(candidates):
+            for cand in candidates:
+                if cand.lower() in [c.lower() for c in master_cols]:
+                    return next(c for c in master_cols if c.lower() == cand.lower())
+            return None
+
+        branch_code_col = find_col(['customer branch code', 'customer_branch_code', 'branch_code'])
+        cust_code_col   = find_col(['customerid', 'cust_code', 'customer_code', 'custcode'])
+        cust_name_col   = find_col(['customername', 'cust_name', 'customer_name', 'customer'])
+        supplier_col    = find_col(['vendor_code', 'supplier_code'])
+        branchcd_col    = find_col(['br_code', 'branchcd', 'branch'])
+
+        if not branch_code_col or not cust_code_col or not cust_name_col:
+            log.warning("⚠️ Cannot detect required columns in Customer Master. Using defaults.")
+            dim['customer_code'] = dim['customer_branch_code']
+            dim['customer_name'] = 'Unknown'
+            dim['supplier_code'] = ''
+            dim['branchcd'] = ''
+        else:
+            # Prepare master mapping: key = customer_branch_code
+            master_renamed = master.rename(columns={
+                branch_code_col: 'customer_branch_code',
+                cust_code_col:   'customer_code',
+                cust_name_col:   'customer_name',
+            })
+            if supplier_col:
+                master_renamed.rename(columns={supplier_col: 'supplier_code'}, inplace=True)
+            else:
+                master_renamed['supplier_code'] = ''
+            if branchcd_col:
+                master_renamed.rename(columns={branchcd_col: 'branchcd'}, inplace=True)
+            else:
+                master_renamed['branchcd'] = ''
+
+            # Keep only necessary columns and deduplicate on customer_branch_code
+            master_keep = master_renamed[['customer_branch_code', 'customer_code', 'customer_name', 'supplier_code', 'branchcd']].drop_duplicates(subset=['customer_branch_code'], keep='first')
+            master_keep['customer_branch_code'] = _clean_id(master_keep['customer_branch_code'])
+            master_keep.set_index('customer_branch_code', inplace=True)
+
+            # Enrich dim
+            dim['customer_code'] = dim['customer_branch_code'].map(master_keep['customer_code']).fillna(dim['customer_branch_code'])
+            dim['customer_name'] = dim['customer_branch_code'].map(master_keep['customer_name']).fillna('Unknown')
+            dim['supplier_code'] = dim['customer_branch_code'].map(master_keep['supplier_code']).fillna('')
+            dim['branchcd']      = dim['customer_branch_code'].map(master_keep['branchcd']).fillna('')
+            log.info(f"📊 Enriched with Customer Master: {len(master_keep):,} mappings")
+
+    # ── Clean final columns ───────────────────────────────────────────
+    dim['customer_branch_code'] = _clean_id(dim['customer_branch_code'])
+    dim['customer_code']        = _clean_id(dim['customer_code'])
+    dim['customer_name']        = dim['customer_name'].astype(str).str.strip()
+    dim['supplier_code']        = _clean_id(dim['supplier_code'])
+    dim['branchcd']             = _clean_id(dim['branchcd'])
+
+    # Remove any empty keys
+    dim = dim[dim['customer_branch_code'] != '']
+    dim = dim[dim['customer_branch_code'] != 'nan']
+
+    # Deduplicate (just in case)
+    before = len(dim)
+    dim = dim.drop_duplicates(subset=['customer_branch_code'], keep='first')
+    if before != len(dim):
+        log.info(f"🧹 Dedup: {before:,} → {len(dim):,} unique customer_branch_codes")
+
+    # ── Final column order ───────────────────────────────────────────
+    dim = dim[['customer_branch_code', 'customer_code', 'customer_name', 'supplier_code', 'branchcd']].sort_values('customer_branch_code').reset_index(drop=True)
+
+    # ── FK Coverage check (should be zero orphans) ────────────────────
+    log.info("\n🔍 Running FK coverage checks...")
+
+    dim_keys_set = set(dim['customer_branch_code'])
+
+    # Check fact_sales_lines
+    sales_orphans = set(sales_keys) - dim_keys_set
+    if sales_orphans:
+        log.error(f"❌ {len(sales_orphans)} orphan cust_branch_key in fact_sales_lines!")
+        log.error(f"   Sample: {list(sales_orphans)[:10]}")
+    else:
+        log.info("✅ FK coverage OK: fact_sales_lines.cust_branch_key → dim_customer")
+
+    # Check fact_collection
+    if len(collection_keys) > 0:
+        coll_orphans = set(collection_keys) - dim_keys_set
+        if coll_orphans:
+            log.error(f"❌ {len(coll_orphans)} orphan cust_branch_key in fact_collection!")
+            log.error(f"   Sample: {list(coll_orphans)[:10]}")
+        else:
+            log.info("✅ FK coverage OK: fact_collection.cust_branch_key → dim_customer")
+
+    # Check fact_debtors_ageing
+    if len(debtors_keys) > 0:
+        debt_orphans = set(debtors_keys) - dim_keys_set
+        if debt_orphans:
+            log.error(f"❌ {len(debt_orphans)} orphan cust_branch_key in fact_debtors_ageing!")
+            log.error(f"   Sample: {list(debt_orphans)[:10]}")
+        else:
+            log.info("✅ FK coverage OK: fact_debtors_ageing.cust_branch_key → dim_customer")
+
+    # Check fact_collected_ageing
+    if len(collected_keys) > 0:
+        col_age_orphans = set(collected_keys) - dim_keys_set
+        if col_age_orphans:
+            log.error(f"❌ {len(col_age_orphans)} orphan cust_branch_key in fact_collected_ageing!")
+            log.error(f"   Sample: {list(col_age_orphans)[:10]}")
+        else:
+            log.info("✅ FK coverage OK: fact_collected_ageing.cust_branch_key → dim_customer")
+
+    # ── Save dim_customer ────────────────────────────────────────────
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    dim.to_csv(DIM_CUSTOMER_PATH, index=False, encoding='utf-8-sig')
+    log.info(f"✅ dim_customer.csv saved → {DIM_CUSTOMER_PATH} | {len(dim):,} rows")
+
+    # ── Clean fact_sales_lines: remove any redundant columns if needed ─
+    log.info("🧹 Cleaning fact_sales_lines — removing 'customer' column if exists...")
+    if Path(FACT_SALES_PATH).exists():
+        df = _read_csv_safe(FACT_SALES_PATH)
+        if 'customer' in df.columns:
+            df.drop(columns=['customer'], inplace=True)
+            df.to_csv(FACT_SALES_PATH, index=False, encoding='utf-8-sig')
+            log.info("   Removed 'customer' column from fact_sales_lines")
+
+    return DIM_CUSTOMER_PATH, FACT_SALES_PATH
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    build_dim_customer()

@@ -1,0 +1,131 @@
+"""
+تحويل بيانات السمات الشهرية للعملاء → dim_sales_and_collection_assignment
+======================================================================
+- يقرأ ملف customer_monthly_attributes.csv
+- يُنتج month_key (YYYYMM) و assignment_key (customer_branch_code_month_key)
+- يُعد ملفاً جاهزاً للـ upsert على assignment_key
+"""
+
+import logging
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+
+log = logging.getLogger(__name__)
+
+INPUT_PATH  = "/opt/airflow/data/customer_monthly_attributes.csv"
+OUTPUT_PATH = "/opt/airflow/data/dim_customer_assignment_ready.csv"
+
+MONTH_MAP = {
+    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APRIL': 4,
+    'MAY': 5, 'JUNE': 6, 'JULY': 7, 'AUGUST': 8,
+    'SEPT': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
+}
+
+
+def _clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = df.columns.str.strip().str.lower()
+    return df
+
+
+def _resolve_col(df_cols, candidates):
+    for cand in candidates:
+        if cand in df_cols:
+            return cand
+    return None
+
+
+def transform_customer_monthly_attributes() -> str:
+    log.info("🔄 تحويل customer_monthly_attributes.csv ...")
+
+    if not Path(INPUT_PATH).exists():
+        raise FileNotFoundError(f"❌ ملف الإدخال غير موجود: {INPUT_PATH}")
+
+    df = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1256"):
+        try:
+            df = pd.read_csv(INPUT_PATH, dtype=str, encoding=enc, on_bad_lines="warn")
+            log.info(f"📖 تم القراءة بـ encoding: {enc}")
+            break
+        except (UnicodeDecodeError, Exception):
+            continue
+    if df is None:
+        raise ValueError(f"❌ تعذّر قراءة الملف: {INPUT_PATH}")
+    df = _clean_column_names(df)
+    log.info(f"📂 تم تحميل {len(df):,} صف | الأعمدة: {df.columns.tolist()}")
+
+    branch_col = _resolve_col(df.columns, [
+        'customer branch code', 'customer_branch_code', 'branch_code', 'cust_branch_key'
+    ])
+    month_col  = _resolve_col(df.columns, ['month'])
+    acc_col    = _resolve_col(df.columns, [
+        'acc manager', 'acc_manager', 'accmanager', 'acc_mgr'
+    ])
+    coll_col   = _resolve_col(df.columns, ['collector', 'collectors'])
+    year_col   = _resolve_col(df.columns, ['year'])
+
+    missing = []
+    if not branch_col: missing.append('customer branch code')
+    if not month_col:  missing.append('month')
+    if not acc_col:    missing.append('acc manager')
+    if not coll_col:   missing.append('collector')
+    if missing:
+        raise ValueError(f"❌ الأعمدة المفقودة: {missing}. المتوفرة: {df.columns.tolist()}")
+
+    columns_to_keep = [branch_col, month_col, acc_col, coll_col] + ([year_col] if year_col else [])
+    df = df[columns_to_keep].copy()
+    rename_dict = {
+        branch_col: 'customer_branch_code',
+        month_col:  'month_raw',
+        acc_col:    'acc_manager',
+        coll_col:   'collector'
+    }
+    if year_col:
+        rename_dict[year_col] = 'year'
+    df.rename(columns=rename_dict, inplace=True)
+
+    for col in ['customer_branch_code', 'acc_manager', 'collector']:
+        df[col] = df[col].astype(str).str.strip().str.replace('.0', '', regex=False)
+
+    df['month_num'] = df['month_raw'].str.upper().map(MONTH_MAP)
+    invalid = df['month_num'].isna().sum()
+    if invalid:
+        log.warning(f"⚠️ {invalid} صف بأسماء شهور غير صالحة – جارٍ حذفها.")
+        df = df.dropna(subset=['month_num'])
+
+    if 'year' not in df.columns:
+        current_year = datetime.now().year
+        df['year'] = current_year
+        log.info(f"📅 عمود 'year' غير موجود – تم افتراض العام الحالي {current_year}")
+    else:
+        df['year'] = pd.to_numeric(df['year'], errors='coerce').fillna(datetime.now().year).astype(int)
+
+    df['month_num'] = df['month_num'].astype(int)
+    df['month_key'] = df['year'] * 100 + df['month_num']
+    df['month_start_date'] = pd.to_datetime(
+        df['year'].astype(str) + '-' + df['month_num'].astype(str) + '-01'
+    )
+
+    # إنشاء المفتاح الموحد
+    df['assignment_key'] = df['customer_branch_code'] + '_' + df['month_key'].astype(str)
+
+    df = df.drop_duplicates(subset=['assignment_key'], keep='last')
+
+    output_cols = ['assignment_key', 'customer_branch_code', 'month_key',
+                   'month_start_date', 'acc_manager', 'collector']
+    df_out = df[output_cols]
+
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(OUTPUT_PATH, index=False, encoding='utf-8-sig')
+    log.info(f"✅ dim_customer_assignment_ready.csv تم الحفظ | {len(df_out):,} صف")
+    return OUTPUT_PATH
+
+
+def transform_customer_monthly_airflow(**context) -> str:
+    return transform_customer_monthly_attributes()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format='[%(asctime)s] %(levelname)s - %(message)s')
+    transform_customer_monthly_attributes()

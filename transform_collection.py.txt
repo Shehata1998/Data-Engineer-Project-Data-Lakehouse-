@@ -1,0 +1,146 @@
+"""
+Transform Collection Data → fact_collection
+────────────────────────────────────────────
+Output columns (all lowercase):
+  date_key, acode, supplier_code, cust_branch_key,
+  calendar_date, month_name, branchcd, customer_code, name, collection_amount
+"""
+
+import pandas as pd
+import logging
+import datetime
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+INPUT_PATH       = "/opt/airflow/data/Customer_Wise.csv"
+OUTPUT_PATH      = "/opt/airflow/data/fact_collection.csv"
+WAREHOUSE_MASTER = "/opt/airflow/data/warehouse_master.csv"
+
+MONTH_TO_LAST_DAY = {
+    'JAN':    (1,  31), 'FEB':    (2,  28), 'MAR':    (3,  31),
+    'APRIL':  (4,  30), 'MAY':    (5,  31), 'JUNE':   (6,  30),
+    'JULY':   (7,  31), 'AUGUST': (8,  31), 'SEPT':   (9,  30),
+    'OCT':    (10, 31), 'NOV':    (11, 30), 'DEC':    (12, 31),
+}
+
+def _read_csv_safe(filepath):
+    for enc in ('utf-8-sig', 'utf-8', 'latin-1'):
+        try:
+            return pd.read_csv(filepath, dtype=str, encoding=enc, on_bad_lines="warn")
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot read {filepath}")
+
+def transform_collection() -> str:
+    log.info("🚀 Transforming collection data...")
+    if not Path(INPUT_PATH).exists():
+        raise FileNotFoundError(f"❌ Not found: {INPUT_PATH}")
+
+    # Load
+    df = _read_csv_safe(INPUT_PATH)
+    df.columns = df.columns.str.strip('"').str.strip()
+    log.info(f"✅ Loaded {len(df):,} rows | Columns: {list(df.columns)}")
+
+    # Filter Collection rows
+    collection_df = df[df['REP'].str.strip() == 'Collection'].copy()
+    log.info(f"✅ Filtered to {len(collection_df):,} collection records")
+
+    # Identify columns
+    month_cols   = ['JAN','FEB','MAR','APRIL','MAY','JUNE',
+                    'JULY','AUGUST','SEPT','OCT','NOV','DEC']
+    id_cols      = ['UNIT_REF','NAME','ACCOUNT','SALE_REP','REP','ACODE','BRANCHCD']
+    avail_months = [m for m in month_cols if m in collection_df.columns]
+    avail_ids    = [c for c in id_cols if c in collection_df.columns]
+
+    # Unpivot
+    df_long = collection_df[avail_ids + avail_months].melt(
+        id_vars=avail_ids, value_vars=avail_months,
+        var_name='month_name', value_name='collection_amount'
+    )
+    log.info(f"✅ Unpivoted to {len(df_long):,} rows")
+
+    # Clean amounts
+    df_long['collection_amount'] = pd.to_numeric(
+        df_long['collection_amount'].astype(str)
+                                   .str.replace(',', '', regex=False)
+                                   .str.strip(),
+        errors='coerce'
+    ).fillna(0)
+
+    # Map UNIT_REF → supplier_code
+    if Path(WAREHOUSE_MASTER).exists():
+        wm = _read_csv_safe(WAREHOUSE_MASTER)
+        wm.columns = wm.columns.str.strip().str.lower()
+        supplier_map = (
+            wm[['sub_supplier','supplier_code']].dropna(subset=['sub_supplier'])
+            .set_index('sub_supplier')['supplier_code'].to_dict()
+        )
+        df_long['supplier_code'] = df_long['UNIT_REF'].astype(str).str.strip().map(supplier_map)
+        unmapped = df_long['supplier_code'].isna().sum()
+        if unmapped:
+            log.warning(f"⚠️ {unmapped} unmapped UNIT_REF")
+        df_long.drop(columns=['UNIT_REF'], inplace=True)
+    else:
+        log.warning("⚠️ Warehouse master not found — supplier_code will be empty")
+        df_long['supplier_code'] = ''
+
+    # Normalize column names to lowercase
+    df_long.columns = df_long.columns.str.strip().str.lower()
+
+    # Clean FK columns
+    df_long['supplier_code'] = df_long['supplier_code'].astype(str).str.strip().str.replace('.0', '', regex=False)
+    df_long['branchcd'] = df_long['branchcd'].astype(str).str.strip() if 'branchcd' in df_long.columns else 'HO'
+    df_long['acode'] = df_long['acode'].astype(str).str.strip().str.replace('.0', '', regex=False) if 'acode' in df_long.columns else ''
+
+    # Rename account → customer_code
+    if 'account' in df_long.columns:
+        df_long.rename(columns={'account': 'customer_code'}, inplace=True)
+        df_long['customer_code'] = df_long['customer_code'].astype(str).str.replace('.0', '', regex=False).str.strip()
+
+    # Build cust_branch_key
+    df_long['cust_branch_key'] = df_long['acode'] + df_long['branchcd']
+    df_long['cust_branch_key'] = df_long['cust_branch_key'].fillna('').replace('', 'UNKNOWN')
+
+    # Date mapping
+    year = datetime.datetime.now().year
+    def _date_key(m):
+        m_upper = m.upper()
+        if m_upper not in MONTH_TO_LAST_DAY:
+            return None
+        mo, d = MONTH_TO_LAST_DAY[m_upper]
+        return int(f"{year}{mo:02d}{d:02d}")
+    def _cal_date(m):
+        m_upper = m.upper()
+        if m_upper not in MONTH_TO_LAST_DAY:
+            return None
+        mo, d = MONTH_TO_LAST_DAY[m_upper]
+        return f"{year}-{mo:02d}-{d:02d}"
+
+    df_long['date_key'] = df_long['month_name'].apply(_date_key)
+    df_long['calendar_date'] = df_long['month_name'].apply(_cal_date)
+    df_long['date_key'] = pd.to_numeric(df_long['date_key'], errors='coerce').fillna(0).astype(int)
+
+    # Keep only required columns (drop sale_rep, rep, etc.)
+    final_cols = [
+        'date_key', 'acode', 'supplier_code', 'cust_branch_key',
+        'calendar_date', 'month_name', 'branchcd', 'customer_code', 'name', 'collection_amount'
+    ]
+    # Ensure all columns exist
+    for col in final_cols:
+        if col not in df_long.columns:
+            df_long[col] = ''
+    df_final = df_long[final_cols].sort_values('date_key').reset_index(drop=True)
+
+    # Save
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    df_final.to_csv(OUTPUT_PATH, index=False, encoding='utf-8-sig')
+    log.info(f"✅ fact_collection.csv saved | {len(df_final):,} rows | Columns: {df_final.columns.tolist()}")
+    return OUTPUT_PATH
+
+def transform_collection_airflow() -> str:
+    return transform_collection()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    transform_collection(

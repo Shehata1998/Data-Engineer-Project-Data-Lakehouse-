@@ -1,0 +1,882 @@
+"""
+
+Build dim_date (DYNAMIC) based on actual data in sales and collection CSVs.
+
+Date range: min(date_key from sales/collection) → max(date_key from sales/collection)
+
+Handles malformed CSV rows using on_bad_lines="warn".
+
+Egyptian holidays included (fixed + Islamic).
+
+"""
+ 
+import csv
+
+import os
+
+import logging
+
+from pathlib import Path
+ 
+import pandas as pd
+ 
+log = logging.getLogger(__name__)
+ 
+FACT_SALES_PATH = "/opt/airflow/data/fact_sales_lines.csv"
+
+FACT_COLLECTION_PATH = "/opt/airflow/data/fact_collection.csv"
+
+DIM_DATE_PATH   = "/opt/airflow/data/dim_date.csv"
+ 
+TODAY = pd.Timestamp.today().normalize()
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+
+# HELPERS
+
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def _diagnose_csv(filepath: str, encoding: str = "utf-8") -> None:
+
+    bad_lines = []
+
+    try:
+
+        with open(filepath, encoding=encoding, errors="replace", newline="") as f:
+
+            reader   = csv.reader(f)
+
+            headers  = next(reader)
+
+            expected = len(headers)
+
+            for lineno, row in enumerate(reader, start=2):
+
+                if len(row) != expected:
+
+                    bad_lines.append((lineno, len(row), row))
+
+    except Exception as exc:
+
+        log.warning(f"⚠️  Diagnosis scan failed: {exc}")
+
+        return
+ 
+    if bad_lines:
+
+        log.warning(
+
+            f"⚠️  {len(bad_lines)} malformed line(s) in {filepath} "
+
+            f"(expected {expected} fields):"
+
+        )
+
+        for lineno, got, row in bad_lines[:20]:
+
+            log.warning(f"   Line {lineno:>6}: got {got} fields → {row}")
+
+        if len(bad_lines) > 20:
+
+            log.warning(f"   … and {len(bad_lines) - 20} more.")
+
+    else:
+
+        log.info(f"✅ No malformed lines found in {filepath}.")
+ 
+ 
+def _read_csv_safe(filepath: str) -> pd.DataFrame:
+
+    for enc in ("utf-8", "latin-1"):
+
+        try:
+
+            _diagnose_csv(filepath, encoding=enc)
+
+            break
+
+        except Exception:
+
+            pass
+ 
+    read_kwargs = dict(dtype=str, on_bad_lines="warn")
+ 
+    for enc in ("utf-8", "latin-1"):
+
+        try:
+
+            df = pd.read_csv(filepath, encoding=enc, **read_kwargs)
+
+            log.info(
+
+                f"📂 Read '{Path(filepath).name}' | encoding={enc} | "
+
+                f"{len(df):,} rows | {len(df.columns)} columns"
+
+            )
+
+            return df
+
+        except UnicodeDecodeError:
+
+            log.warning(f"⚠️  {enc} failed for {filepath}, trying next …")
+
+        except Exception as exc:
+
+            log.error(f"❌ Could not read {filepath} with encoding={enc}: {exc}")
+
+            raise
+ 
+    raise ValueError(f"❌ Could not read {filepath} with utf-8 or latin-1.")
+ 
+ 
+def _fix_permissions(path: str) -> None:
+
+    try:
+
+        os.system(f"chmod -R 777 {path}")
+
+    except Exception as exc:
+
+        log.warning(f"WARNING: Could not fix permissions for {path}: {exc}")
+ 
+ 
+def _week_of_month(d: pd.Timestamp) -> int:
+
+    return (d.day - 1) // 7 + 1
+ 
+ 
+def _get_egyptian_holidays(year_start: int, year_end: int) -> dict:
+
+    FIXED = {
+
+        (1,  1):  "رأس السنة الميلادية | New Year's Day",
+
+        (1,  7):  "عيد الميلاد المجيد (القبطي) | Coptic Christmas",
+
+        (1, 25):  "ثورة 25 يناير | January 25 Revolution Day",
+
+        (5,  1):  "عيد العمال | Labour Day",
+
+        (6, 30):  "ثورة 30 يونيو | June 30 Revolution Day",
+
+        (7, 23):  "ثورة 23 يوليو | July 23 Revolution Day",
+
+        (10, 6):  "عيد القوات المسلحة | Armed Forces Day",
+
+    }
+
+    ISLAMIC = {
+
+        2022: [
+
+            (5, 2,  "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (5, 3,  "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (5, 4,  "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (7, 9,  "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (7, 10, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (7, 11, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (7, 12, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (7, 30, "رأس السنة الهجرية | Islamic New Year"),
+
+            (10, 8, "المولد النبوي الشريف | Prophet's Birthday"),
+
+        ],
+
+        2023: [
+
+            (4, 21, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (4, 22, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (4, 23, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (6, 28, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6, 29, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6, 30, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (7,  1, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (7, 19, "رأس السنة الهجرية | Islamic New Year"),
+
+            (9, 27, "المولد النبوي الشريف | Prophet's Birthday"),
+
+        ],
+
+        2024: [
+
+            (4,  9, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (4, 10, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (4, 11, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (6, 16, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6, 17, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6, 18, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6, 19, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (7,  7, "رأس السنة الهجرية | Islamic New Year"),
+
+            (9, 15, "المولد النبوي الشريف | Prophet's Birthday"),
+
+        ],
+
+        2025: [
+
+            (3, 30, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (3, 31, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (4,  1, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (6,  6, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6,  7, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6,  8, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6,  9, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6, 26, "رأس السنة الهجرية | Islamic New Year"),
+
+            (9,  4, "المولد النبوي الشريف | Prophet's Birthday"),
+
+        ],
+
+        2026: [
+
+            (3, 20, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (3, 21, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (3, 22, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (5, 27, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5, 28, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5, 29, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5, 30, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6, 16, "رأس السنة الهجرية | Islamic New Year"),
+
+            (8, 24, "المولد النبوي الشريف | Prophet's Birthday"),
+
+        ],
+
+        2027: [
+
+            (3,  9, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (3, 10, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (3, 11, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (5, 16, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5, 17, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5, 18, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5, 19, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (6,  5, "رأس السنة الهجرية | Islamic New Year"),
+
+            (8, 14, "المولد النبوي الشريف | Prophet's Birthday"),
+
+        ],
+
+        2028: [
+
+            (2, 26, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (2, 27, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (2, 28, "عيد الفطر المبارك | Eid al-Fitr"),
+
+            (5,  5, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5,  6, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5,  7, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5,  8, "عيد الأضحى المبارك | Eid al-Adha"),
+
+            (5, 25, "رأس السنة الهجرية | Islamic New Year"),
+
+            (8,  3, "المولد النبوي الشريف | Prophet's Birthday"),
+
+        ],
+
+    }
+ 
+    hdict: dict = {}
+
+    for year in range(year_start, year_end + 1):
+
+        for (m, d), name in FIXED.items():
+
+            try:
+
+                hdict[pd.Timestamp(year=year, month=m, day=d).date()] = name
+
+            except Exception:
+
+                pass
+
+        if year in ISLAMIC:
+
+            for (m, d, name) in ISLAMIC[year]:
+
+                try:
+
+                    dt = pd.Timestamp(year=year, month=m, day=d).date()
+
+                    if dt not in hdict:
+
+                        hdict[dt] = name
+
+                except Exception:
+
+                    pass
+
+        else:
+
+            log.warning(f"⚠️  No Islamic holiday data for {year} — add to ISLAMIC dict.")
+
+    return hdict
+ 
+ 
+def _is_working_day(d: pd.Timestamp, holiday_set: set) -> bool:
+
+    return d.dayofweek != 4 and d.date() not in holiday_set
+ 
+ 
+def _month_workdays(year: int, month: int, holiday_set: set) -> int:
+
+    month_range = pd.date_range(
+
+        start=pd.Timestamp(year=year, month=month, day=1),
+
+        end=pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0),
+
+        freq="D",
+
+    )
+
+    return sum(_is_working_day(d, holiday_set) for d in month_range)
+ 
+ 
+def _act_workdays(d: pd.Timestamp, holiday_set: set) -> int:
+
+    month_start = pd.Timestamp(year=d.year, month=d.month, day=1)
+
+    day_range   = pd.date_range(start=month_start, end=d, freq="D")
+
+    return sum(_is_working_day(x, holiday_set) for x in day_range)
+ 
+ 
+def _get_date_range_from_files() -> tuple:
+
+    """
+
+    Read fact_sales_lines.csv and fact_collection.csv (if exist),
+
+    extract date_key (YYYYMMDD) from each, compute min and max dates.
+
+    Returns (start_date, end_date) as pd.Timestamp.
+
+    If no valid dates, defaults to last 5 years from today.
+
+    """
+
+    all_dates = []
+ 
+    def extract_dates(filepath: str) -> list:
+
+        """Extract valid Timestamp dates from CSV file."""
+
+        if not Path(filepath).exists():
+
+            log.warning(f"⚠️  File not found: {filepath}")
+
+            return []
+
+        try:
+
+            df = pd.read_csv(filepath, dtype=str, on_bad_lines="warn")
+
+            dates = []
+
+            # Try to get dates from 'date_key' column first
+
+            if "date_key" in df.columns:
+
+                # Convert date_key (YYYYMMDD) to datetime
+
+                date_key_series = pd.to_numeric(df["date_key"], errors="coerce").dropna()
+
+                if not date_key_series.empty:
+
+                    # Convert to string with zero padding (e.g., 20240930)
+
+                    date_str = date_key_series.astype(str).str.zfill(8)
+
+                    parsed = pd.to_datetime(date_str, format="%Y%m%d", errors="coerce")
+
+                    dates.extend(parsed.dropna().tolist())
+
+            # If no date_key, try 'inv_dated' (sales)
+
+            if not dates and "inv_dated" in df.columns:
+
+                parsed = pd.to_datetime(df["inv_dated"], errors="coerce")
+
+                dates.extend(parsed.dropna().tolist())
+
+            # If still none, try 'calendar_date' (collection)
+
+            if not dates and "calendar_date" in df.columns:
+
+                parsed = pd.to_datetime(df["calendar_date"], errors="coerce")
+
+                dates.extend(parsed.dropna().tolist())
+
+            return dates
+
+        except Exception as e:
+
+            log.warning(f"⚠️  Could not read dates from {filepath}: {e}")
+
+            return []
+ 
+    # Extract from sales and collection
+
+    sales_dates = extract_dates(FACT_SALES_PATH)
+
+    all_dates.extend(sales_dates)
+
+    collection_dates = extract_dates(FACT_COLLECTION_PATH)
+
+    all_dates.extend(collection_dates)
+ 
+    # Remove any remaining NaT (should already be filtered, but safe)
+
+    valid_dates = [d for d in all_dates if pd.notna(d)]
+ 
+    if not valid_dates:
+
+        log.warning("⚠️  No valid date data found in any fact table. Using default range (last 5 years).")
+
+        end_date = TODAY
+
+        start_date = end_date - pd.DateOffset(years=5)
+
+        return start_date.normalize(), end_date.normalize()
+ 
+    min_date = min(valid_dates).normalize()
+
+    max_date = max(valid_dates).normalize()
+
+    log.info(f"📅 Date range from data: {min_date.date()} → {max_date.date()}")
+
+    return min_date, max_date
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+
+# MAIN BUILD FUNCTION (DYNAMIC)
+
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def build_dim_date() -> str:
+
+    log.info("🔄 Building dim_date dynamically from sales & collection data ...")
+ 
+    START_DATE, END_DATE = _get_date_range_from_files()
+ 
+    df = pd.DataFrame({"Date": pd.date_range(start=START_DATE, end=END_DATE, freq="D")})
+
+    log.info(f"✅ {len(df):,} dates | {START_DATE.date()} → {END_DATE.date()}")
+ 
+    # ── Holidays ──────────────────────────────────────────────────────
+
+    y_min = START_DATE.year
+
+    y_max = END_DATE.year
+
+    eg_holidays  = _get_egyptian_holidays(y_min, y_max)
+
+    holiday_set  = set(eg_holidays.keys())
+
+    log.info(f"🗓️  {len(eg_holidays)} holiday records loaded ({y_min}–{y_max})")
+ 
+    # ── Pre-compute monthly work-day totals ───────────────────────────
+
+    log.info("⚙️  Pre-computing monthly work-day totals ...")
+
+    D = df["Date"]
+
+    unique_months  = D.dt.to_period("M").unique()
+
+    total_wd_map: dict = {}
+
+    for period in unique_months:
+
+        total_wd_map[(period.year, period.month)] = _month_workdays(
+
+            period.year, period.month, holiday_set
+
+        )
+ 
+    # ── Build columns ─────────────────────────────────────────────────
+
+    log.info("🏗️  Building columns ...")
+ 
+    df["DATE_KEY"]   = D.dt.strftime("%Y%m%d").astype(int)
+
+    df["MonthNum"]   = D.dt.month
+
+    df["Month"]      = D.dt.strftime("%b")
+
+    df["MonthLong"]  = D.dt.strftime("%B")
+
+    df["Quarter"]    = "Q" + D.dt.quarter.astype(str)
+
+    df["Year"]       = D.dt.year
+ 
+    df["FiscalMonthNum"]  = D.dt.month
+
+    df["FiscalMonth"]     = D.dt.strftime("%b")
+
+    df["FiscalMonthLong"] = D.dt.strftime("%B")
+
+    df["FiscalQuarter"]   = "FQ" + D.dt.quarter.astype(str)
+
+    df["FiscalYear"]      = "FY" + D.dt.strftime("%y")
+ 
+    today_ym = TODAY.year * 12 + TODAY.month
+
+    date_ym  = D.dt.year * 12 + D.dt.month
+
+    df["CurMonthOffset"] = date_ym - today_ym
+ 
+    today_q = (TODAY.year * 4) + ((TODAY.month - 1) // 3)
+
+    date_q  = (D.dt.year * 4) + ((D.dt.month - 1) // 3)
+
+    df["CurQuarterOffset"] = date_q - today_q
+ 
+    df["CurYearOffset"]       = D.dt.year - TODAY.year
+
+    df["CurFiscalYearOffset"] = df["CurYearOffset"]
+
+    df["CurrentDayOffset"]    = (D - TODAY).dt.days
+ 
+    df["FutureDate"] = df["CurrentDayOffset"].apply(
+
+        lambda x: "Future" if x > 0 else ("Today" if x == 0 else "Past")
+
+    )
+ 
+    df["MonthYearNum"]  = (D.dt.year * 100 + D.dt.month).astype(int)
+
+    df["MonthYear"]     = D.dt.strftime("%b-%y")
+
+    df["MonthYearLong"] = D.dt.strftime("%b-%Y")
+ 
+    df["WeekdayNum"]     = ((D.dt.dayofweek + 2) % 7 + 1).astype(int)
+
+    df["Weekday"]        = D.dt.strftime("%a")
+
+    df["WeekdayWeekend"] = D.dt.dayofweek.apply(
+
+        lambda x: "Weekend" if x == 4 else "Weekday"
+
+    )
+ 
+    df["WeekOfYear"]           = D.dt.isocalendar().week.astype(int)
+
+    df["WeekOf1stDateOfMonth"] = D.apply(
+
+        lambda r: pd.Timestamp(year=r.year, month=r.month, day=1).isocalendar().week
+
+    )
+
+    df["WeekOfMonth"] = D.apply(_week_of_month)
+
+    df["WeekDate"]    = D.apply(
+
+        lambda r: f"{r.day}-{r.strftime('%b')}-{r.strftime('%y')}"
+
+    )
+ 
+    first_monday       = D.min() - pd.Timedelta(days=D.min().weekday())
+
+    df["WeekSequenceNum"] = ((D - first_monday).dt.days // 7 + 1).astype(int)
+ 
+    today_week_start  = TODAY - pd.Timedelta(days=TODAY.weekday())
+
+    date_week_starts  = D - D.dt.dayofweek.apply(lambda x: pd.Timedelta(days=x))
+
+    df["CurWeekOffset"] = ((date_week_starts - today_week_start).dt.days // 7).astype(int)
+ 
+    df["DayOfYear"] = D.dt.dayofyear
+ 
+    df["Flag_YTD"] = df.apply(
+
+        lambda r: "YTD" if (r["Date"].year == TODAY.year and r["Date"] <= TODAY) else "",
+
+        axis=1,
+
+    )
+
+    df["Flag_MTD"] = df.apply(
+
+        lambda r: "MTD" if (
+
+            r["Date"].year  == TODAY.year
+
+            and r["Date"].month == TODAY.month
+
+            and r["Date"] <= TODAY
+
+        ) else "",
+
+        axis=1,
+
+    )
+
+    today_qtr = (TODAY.month - 1) // 3
+
+    df["Flag_QTD"] = df.apply(
+
+        lambda r: "QTD" if (
+
+            r["Date"].year  == TODAY.year
+
+            and (r["Date"].month - 1) // 3 == today_qtr
+
+            and r["Date"] <= TODAY
+
+        ) else "",
+
+        axis=1,
+
+    )
+ 
+    df["IS_FRIDAY"]      = (D.dt.dayofweek == 4).astype(int)
+
+    df["IS_HOLIDAY"]     = D.dt.date.map(lambda d: 1 if d in holiday_set else 0)
+
+    df["HOLIDAY_NAME"]   = D.dt.date.map(lambda d: eg_holidays.get(d, None))
+
+    df["IS_WORKING_DAY"] = (
+
+        (df["IS_FRIDAY"] == 0) & (df["IS_HOLIDAY"] == 0)
+
+    ).astype(int)
+ 
+    log.info("⚙️  Computing ActWorkDays per row ...")
+
+    df["TotalWorkDays"] = D.apply(lambda r: total_wd_map[(r.year, r.month)])
+
+    df["ActWorkDays"]   = D.apply(lambda r: _act_workdays(r, holiday_set))
+ 
+    df["DateTime"] = D.apply(lambda r: f"{r.month}/{r.day}/{r.year} 0:00")
+ 
+    # rename Date → date (lowercase) to match PostgreSQL schema
+
+    df.rename(columns={"Date": "date"}, inplace=True)
+ 
+    FINAL_COLS = [
+
+        "DATE_KEY", "date",
+
+        "MonthNum", "Month", "MonthLong",
+
+        "Quarter", "Year",
+
+        "FiscalMonthNum", "FiscalMonth", "FiscalMonthLong",
+
+        "FiscalQuarter", "FiscalYear",
+
+        "CurMonthOffset", "CurQuarterOffset", "CurYearOffset",
+
+        "FutureDate",
+
+        "MonthYearNum", "MonthYear", "MonthYearLong",
+
+        "WeekdayNum", "Weekday", "WeekdayWeekend",
+
+        "WeekSequenceNum", "CurWeekOffset", "CurFiscalYearOffset",
+
+        "DayOfYear",
+
+        "Flag_YTD", "Flag_MTD", "Flag_QTD",
+
+        "WeekDate", "CurrentDayOffset",
+
+        "WeekOfYear", "WeekOf1stDateOfMonth", "WeekOfMonth",
+
+        "TotalWorkDays", "ActWorkDays",
+
+        "DateTime",
+
+        "IS_FRIDAY", "IS_HOLIDAY", "HOLIDAY_NAME", "IS_WORKING_DAY",
+
+    ]
+ 
+    dim_date = (
+
+        df[FINAL_COLS].copy()
+
+        .sort_values("DATE_KEY")
+
+        .reset_index(drop=True)
+
+    )
+ 
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+
+    dim_date.to_csv(DIM_DATE_PATH, index=False, encoding="utf-8-sig")
+
+    _fix_permissions(DIM_DATE_PATH)
+ 
+    log.info(f"✅ dim_date.csv saved → {DIM_DATE_PATH}")
+
+    log.info(f"📦 Total rows      : {len(dim_date):,}")
+
+    log.info(f"📋 Total columns   : {len(dim_date.columns)}")
+
+    log.info(f"✅ أيام العمل      : {dim_date['IS_WORKING_DAY'].sum():,}")
+
+    log.info(f"🕌 الجمع           : {dim_date['IS_FRIDAY'].sum():,}")
+
+    log.info(f"🎉 أجازات رسمية   : {dim_date['IS_HOLIDAY'].sum():,}")
+ 
+    return DIM_DATE_PATH
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CLEAN FACT TABLE (optional – keep as before if needed)
+
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def clean_fact_sales_lines() -> str:
+
+    log.info("\n" + "=" * 70)
+
+    log.info("🧹 CLEANING fact_sales_lines")
+
+    log.info("=" * 70)
+ 
+    if not Path(FACT_SALES_PATH).exists():
+
+        raise FileNotFoundError(f"❌ fact_sales_lines not found: {FACT_SALES_PATH}")
+ 
+    df = _read_csv_safe(FACT_SALES_PATH)
+ 
+    # ── Normalize all column names to lowercase ───────────────────────
+
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    log.info(f"📊 Loaded {len(df):,} rows | {len(df.columns)} columns")
+
+    log.info(f"📋 Columns: {df.columns.tolist()}")
+ 
+    # Remove cols that are now in dims (lowercase names)
+
+    REMOVE_COLS = ["inv_dated", "order_dt", "ent_dt", "month", "year", "quarter", "customer"]
+
+    to_drop = [c for c in REMOVE_COLS if c in df.columns]
+
+    if to_drop:
+
+        df.drop(columns=to_drop, inplace=True)
+
+        log.info(f"🗑️  Dropped: {to_drop}")
+ 
+    # Validate date_key FK column exists (lowercase)
+
+    if "date_key" not in df.columns:
+
+        raise ValueError(
+
+            f"❌ 'date_key' column missing — required to join dim_date.\n"
+
+            f"   Available columns: {df.columns.tolist()}"
+
+        )
+ 
+    log.info(f"✅ date_key range: {df['date_key'].min()} → {df['date_key'].max()}")
+ 
+    df.to_csv(FACT_SALES_PATH, index=False, encoding="utf-8-sig",
+
+              quoting=csv.QUOTE_ALL)
+
+    log.info(f"✅ Updated | {len(df):,} rows | {len(df.columns)} columns")
+
+    return FACT_SALES_PATH
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ENTRY POINTS
+
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def build_dim_date_airflow() -> tuple:
+
+    return main()
+ 
+ 
+def main() -> tuple:
+
+    log.info("\n" + "=" * 70)
+
+    log.info("🚀 BUILDING DIMENSION: dim_date (DYNAMIC based on sales+collection)")
+
+    log.info("=" * 70)
+
+    dim_date_path = build_dim_date()
+
+    fact_path     = clean_fact_sales_lines()
+
+    log.info("\n" + "=" * 70)
+
+    log.info("✅ COMPLETE")
+
+    log.info("=" * 70)
+
+    return dim_date_path, fact_path
+ 
+ 
+if __name__ == "__main__":
+
+    logging.basicConfig(
+
+        level=logging.INFO,
+
+        format="[%(asctime)s] %(levelname)s - %(message)s",
+
+    )
+
+    main()
+ 

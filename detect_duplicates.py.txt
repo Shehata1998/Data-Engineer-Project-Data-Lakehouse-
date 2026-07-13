@@ -1,0 +1,144 @@
+"""
+
+detect_duplicates.py
+
+─────────────────────
+
+Detects duplicate rows in fact_sales_lines.csv based on the primary key
+
+(date_key, inv_no, icode) and saves them to duplicates_report.csv with details.
+
+"""
+ 
+import pandas as pd
+
+from pathlib import Path
+ 
+# File paths
+
+INPUT_CSV = Path("/opt/airflow/data/fact_sales_lines.csv")
+
+OUTPUT_REPORT = Path("/opt/airflow/data/duplicates_report.csv")
+ 
+# Primary key columns
+
+PK_COLS = ["date_key", "inv_no", "icode"]
+ 
+# Numeric columns that may differ in duplicates
+
+NUMERIC_COLS = [
+
+    "inv_quantity", "inv_amount", "tax_amount", "line_total",
+
+    "bill_total", "inv_wt_tons", "tot_pkgs", "inv_rate"
+
+]
+ 
+# Text columns
+
+TEXT_COLS = ["cust_code", "supplier_code", "cust_branch_key", "inv_dated"]
+ 
+ 
+def main():
+
+    if not INPUT_CSV.exists():
+
+        print(f"❌ Input file not found: {INPUT_CSV}")
+
+        return
+ 
+    print(f"📂 Reading file: {INPUT_CSV.name}")
+
+    df = pd.read_csv(INPUT_CSV, dtype=str, low_memory=False)
+
+    print(f"   ✅ Total rows: {len(df):,}")
+ 
+    # Convert numeric columns to numbers for easier comparison
+
+    for col in NUMERIC_COLS:
+
+        if col in df.columns:
+
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+ 
+    # Identify duplicate rows based on primary key
+
+    # Add a column with the count of duplicates per key
+
+    df["dup_count"] = df.groupby(PK_COLS).transform("size")
+
+    duplicates = df[df["dup_count"] > 1].copy()
+
+    if duplicates.empty:
+
+        print("✅ No duplicate rows found based on primary key.")
+
+        return
+ 
+    print(f"⚠️  Rows involved in duplicates: {len(duplicates):,} rows (total occurrences: {duplicates['dup_count'].sum():,})")
+
+    # Add a rank column for each duplicate group (1st, 2nd, etc.)
+
+    duplicates["rank"] = duplicates.groupby(PK_COLS).cumcount() + 1
+
+    # Determine which row will be kept (last one when using keep='last')
+
+    duplicates["is_kept"] = duplicates.groupby(PK_COLS)["rank"].transform("max") == duplicates["rank"]
+
+    # Reorder columns for readability
+
+    output_cols = PK_COLS + ["rank", "is_kept", "dup_count"] + NUMERIC_COLS + TEXT_COLS
+
+    output_cols = [c for c in output_cols if c in duplicates.columns]
+
+    duplicates = duplicates[output_cols].sort_values(PK_COLS + ["rank"])
+
+    # Save report
+
+    duplicates.to_csv(OUTPUT_REPORT, index=False, encoding="utf-8-sig")
+
+    print(f"📄 Duplicates report saved to: {OUTPUT_REPORT}")
+
+    # Quick statistics
+
+    unique_dup_keys = duplicates[PK_COLS].drop_duplicates().shape[0]
+
+    print(f"\n📊 Summary:")
+
+    print(f"   - Number of duplicate primary keys: {unique_dup_keys:,}")
+
+    print(f"   - Total duplicate rows (including original): {len(duplicates):,}")
+
+    print(f"   - Rows that will be kept (is_kept = True): {duplicates['is_kept'].sum():,}")
+
+    print(f"   - Rows that will be ignored/merged during UPSERT: {len(duplicates) - duplicates['is_kept'].sum():,}")
+
+    # Show sample duplicates
+
+    print("\n🔍 Sample duplicates (first 5 groups):")
+
+    sample_keys = duplicates[PK_COLS].drop_duplicates().head(5)
+
+    for _, key in sample_keys.iterrows():
+
+        key_tuple = tuple(key)
+
+        subset = duplicates[(duplicates[PK_COLS[0]] == key_tuple[0]) & 
+
+                            (duplicates[PK_COLS[1]] == key_tuple[1]) & 
+
+                            (duplicates[PK_COLS[2]] == key_tuple[2])]
+
+        print(f"\n   Key: {key_tuple}")
+
+        for _, row in subset.iterrows():
+
+            kept = "✅" if row["is_kept"] else "❌"
+
+            print(f"      {kept} rank={int(row['rank'])} | inv_amount={row.get('inv_amount', 'N/A')} | bill_total={row.get('bill_total', 'N/A')}")
+ 
+ 
+if __name__ == "__main__":
+
+    main()
+ 

@@ -1,0 +1,248 @@
+"""
+transform_collected_ageing.py
+─────────────────────────────────────────────────────────────────────────────
+Transform Collected Invoice Ageing YTD → fact_collected_ageing (LONG FORMAT)
+
+Source columns (actual ERP export):
+    CUSTOMER_NAME  → client_name
+    INV_NO         → inv_no
+    INV_DTD        → inv_date
+    PAYMENT_TERMS  → (dropped)
+    DUE_DTD        → due_date
+    PYMT_DTD       → payment_date
+    GAP_DAYS       → (dropped)
+    PAY_DAYS       → (dropped)
+    BKT_0_30       → col_0_to_30
+    BKT_31_60      → col_31_to_60
+    BKT_61_90      → col_61_to_90
+    BKT_91_120     → col_91_to_120
+    BKT_121_150    → col_121_to_150
+    BKT_OVER_151   → col_over_150
+    PAY_STATUS     → (dropped)
+    VEND_CODE      → client_code
+    BILL_AMT       → inv_amount
+    PYMT_AMT       → total_collected
+    BR_CD          → supplier_code  (also used as branchcd)
+
+Composite PK : (client_code, supplier_code, inv_no, collection_term)
+
+Output schema matches fact_collected_ageing PostgreSQL table:
+    client_code, supplier_code, inv_no, collection_term, collection_value,
+    cust_branch_key, client_name, branchcd,
+    inv_date, inv_amount, total_collected, due_date, payment_date,
+    payment_date_key, month_key, assignment_key
+"""
+
+import logging
+from pathlib import Path
+
+import pandas as pd
+
+log = logging.getLogger(__name__)
+
+INPUT_CSV  = "/opt/airflow/data/Collected_Invoice_Ageing_Report_YTD.csv"
+OUTPUT_CSV = "/opt/airflow/data/fact_collected_ageing.csv"
+
+# ── Column mapping: source → standard ────────────────────────────────────────
+RENAME_MAP = {
+    "vend_code":     "client_code",
+    "customer_name": "client_name",
+    "br_cd":         "supplier_code",   # BR_CD = supplier_code = branchcd
+    "inv_dtd":       "inv_date",
+    "due_dtd":       "due_date",
+    "pymt_dtd":      "payment_date",
+    "bill_amt":      "inv_amount",
+    "pymt_amt":      "total_collected",
+    "bkt_0_30":      "col_0_to_30",
+    "bkt_31_60":     "col_31_to_60",
+    "bkt_61_90":     "col_61_to_90",
+    "bkt_91_120":    "col_91_to_120",
+    "bkt_121_150":   "col_121_to_150",
+    "bkt_over_151":  "col_over_150",
+}
+
+# Drop after rename — operational columns not in fact schema
+DROP_COLS = ["payment_terms", "gap_days", "pay_days", "pay_status"]
+
+BUCKET_COLS = [
+    "col_0_to_30", "col_31_to_60", "col_61_to_90",
+    "col_91_to_120", "col_121_to_150", "col_over_150",
+]
+
+# Final output — must match PostgreSQL fact_collected_ageing schema exactly
+OUTPUT_COLS = [
+    "client_code",      # PK 1
+    "supplier_code",    # PK 2
+    "inv_no",           # PK 3
+    "collection_term",  # PK 4  (e.g. "0-30", "61-90", "over-150")
+    "collection_value", # numeric(18,4)
+    "cust_branch_key",  # client_code + supplier_code
+    "client_name",      # text
+    "branchcd",         # text  (= supplier_code)
+    "inv_date",         # text
+    "inv_amount",       # numeric(18,4)
+    "total_collected",  # numeric(18,4)
+    "due_date",         # text
+    "payment_date",     # text
+    "payment_date_key", # integer YYYYMMDD
+    "month_key",        # integer YYYYMM
+    "assignment_key",   # text    cust_branch_key_YYYYMM
+]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _read_csv_safe(path: str) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            df = pd.read_csv(path, dtype=str, encoding=enc, on_bad_lines="warn")
+            df.columns = (
+                df.columns.str.strip().str.strip('"')
+                .str.lower().str.replace(" ", "_")
+            )
+            if len(df) > 0:
+                df = df.iloc[:-1]   # remove ERP summary/total last row
+                log.info("   🧹 Removed last summary row")
+            return df
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot read {path}")
+
+
+def _clean_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    ).fillna(0.0)
+
+
+def _to_date_key(date_series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(date_series, errors="coerce")
+    return dt.dt.strftime("%Y%m%d").fillna("0").astype(int)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def transform_collected_ageing(report_date_str=None) -> tuple:
+    log.info("🚀 Transforming Collected Invoice Ageing (long format) ...")
+
+    if not Path(INPUT_CSV).exists():
+        raise FileNotFoundError(f"❌ Not found: {INPUT_CSV}")
+
+    # 1. Load
+    df = _read_csv_safe(INPUT_CSV)
+    log.info(f"✅ Loaded {len(df):,} rows | Columns: {df.columns.tolist()}")
+
+    # 2. Rename source columns → standard names
+    actual_rename = {k: v for k, v in RENAME_MAP.items() if k in df.columns}
+    df.rename(columns=actual_rename, inplace=True)
+    log.info(f"   🔁 Renamed: {actual_rename}")
+
+    # 3. Validate required columns
+    required = ["client_code", "client_name", "supplier_code", "inv_no",
+                "inv_date", "due_date", "payment_date", "inv_amount", "total_collected"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"❌ Required columns missing after rename: {missing}\n"
+            f"   Available: {df.columns.tolist()}"
+        )
+
+    # 4. Clean key columns
+    df["client_code"]     = df["client_code"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    df["supplier_code"]   = df["supplier_code"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    df["inv_no"]          = df["inv_no"].astype(str).str.strip()
+    df["branchcd"]        = df["supplier_code"].copy()        # BR_CD = branchcd
+    df["cust_branch_key"] = df["client_code"] + df["supplier_code"]
+
+    # 5. Date keys
+    df["payment_date_key"] = _to_date_key(df["payment_date"])
+    df["month_key"]        = (df["payment_date_key"] // 100).astype(int)
+
+    # 6. Assignment key → links to dim_sales_and_collection_assignment
+    df["assignment_key"] = df["cust_branch_key"] + "_" + df["month_key"].astype(str)
+
+    # 7. Numeric columns
+    for col in ["inv_amount", "total_collected"] + BUCKET_COLS:
+        if col in df.columns:
+            df[col] = _clean_numeric(df[col])
+        else:
+            df[col] = 0.0
+
+    # 8. Drop operational columns
+    drop_existing = [c for c in DROP_COLS if c in df.columns]
+    if drop_existing:
+        df.drop(columns=drop_existing, inplace=True)
+        log.info(f"   🗑️  Dropped: {drop_existing}")
+
+    # 9. Unpivot buckets → long format
+    buckets_present = [c for c in BUCKET_COLS if c in df.columns]
+    if not buckets_present:
+        raise ValueError(f"❌ No bucket columns found. Expected: {BUCKET_COLS}")
+
+    id_vars = [c for c in df.columns if c not in buckets_present]
+    long_df = pd.melt(
+        df,
+        id_vars=id_vars,
+        value_vars=buckets_present,
+        var_name="collection_term",
+        value_name="collection_value",
+    )
+
+    # Normalise label: "col_0_to_30" → "0-30", "col_over_150" → "over-150"
+    long_df["collection_term"] = (
+        long_df["collection_term"]
+        .str.replace("col_", "", regex=False)
+        .str.replace("_to_", "-", regex=False)
+        .str.replace("over_", "over-", regex=False)
+        .str.replace("_", "-", regex=False)
+    )
+
+    before = len(long_df)
+    long_df = long_df[long_df["collection_value"] != 0].copy()
+    log.info(f"   📊 Unpivoted: {before:,} → {len(long_df):,} rows (zero buckets removed)")
+
+    # 10. Select exact output schema
+    for col in OUTPUT_COLS:
+        if col not in long_df.columns:
+            long_df[col] = None
+
+    output_df = long_df[OUTPUT_COLS].copy()
+
+    # 11. Drop rows with null/empty PK
+    pk_cols = ["client_code", "supplier_code", "inv_no", "collection_term"]
+    before = len(output_df)
+    output_df = output_df.dropna(subset=pk_cols)
+    for c in pk_cols:
+        output_df = output_df[output_df[c].astype(str).str.strip() != ""]
+    removed = before - len(output_df)
+    if removed:
+        log.warning(f"   ⚠️  Removed {removed:,} rows with missing PK")
+
+    # 12. Deduplicate on composite PK
+    before_dedup = len(output_df)
+    output_df = output_df.drop_duplicates(subset=pk_cols, keep="last")
+    if before_dedup != len(output_df):
+        log.info(f"   🧹 Dedup: {before_dedup:,} → {len(output_df):,} rows")
+
+    # 13. Save
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    output_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    log.info(
+        f"✅ fact_collected_ageing.csv saved | {len(output_df):,} rows | "
+        f"Columns: {output_df.columns.tolist()}"
+    )
+    return OUTPUT_CSV, len(output_df)
+
+
+def transform_collected_ageing_airflow(**context) -> str:
+    path, _ = transform_collected_ageing()
+    return path
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s - %(message)s",
+    )
+    transform_collected_ageing()

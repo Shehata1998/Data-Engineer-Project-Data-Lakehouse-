@@ -1,0 +1,280 @@
+"""
+DAG: erp_reports_full_etl
+=========================
+Extract  →  Transform  →  Load (PostgreSQL)
+ 
+Sources:
+    1. Sales Invoices YTD             → fact_sales_lines
+    2. Customer Wise 12M Sales YTD    → fact_collection
+    3. Debtors Ageing Summary YTD     → fact_debtors_ageing
+    4. Collected Invoice Ageing YTD   → fact_collected_ageing  ← ACTIVE
+    5. Customer Master (Google Drive) → dim_customer
+    6. Item Master     (Google Drive) → dim_item
+    7. Customer Monthly Attributes    → dim_sales_and_collection_assignment
+ 
+Schedule: Daily 06:00 AM
+"""
+ 
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from datetime import timedelta
+import os, logging, sys
+ 
+sys.path.insert(0, "/opt/airflow/code")
+ 
+from transform_sales                        import transform_sales
+from transform_dim_customer                 import build_dim_customer
+from build_dim_date                         import build_dim_date_airflow
+from extract_customer_master                import download_customer_master
+from extract_item_master                    import download_item_master
+from extract_warehouse_master               import download_warehouse_master
+from extract_customer_monthly_attributes    import download_customer_monthly_attributes
+from transform_dim_item                     import build_dim_item
+from transform_collection                   import transform_collection_airflow
+from transform_debtors_ageing               import transform_debtors_ageing_airflow
+from transform_collected_ageing             import transform_collected_ageing_airflow
+from transform_customer_monthly_attributes  import transform_customer_monthly_airflow
+from load_to_postgres                       import (
+    load_dimensions, load_fact_sales,
+    load_fact_collection, load_fact_debtors,
+    load_fact_collected_ageing,
+)
+from extract_standalone_report              import download_standalone_report
+from load_standalone_report                 import transform_and_load_standalone
+ 
+log = logging.getLogger(__name__)
+ 
+default_args = {
+    "owner":            "salman",
+    "retries":          2,
+    "retry_delay":      timedelta(minutes=5),
+    "email_on_failure": True,
+    "email_on_retry":   False,
+    "email":            ["ar.ahmed@smsupp.com"],
+}
+ 
+DATA_DIR        = "/opt/airflow/data"
+SCREENSHOTS_DIR = "/opt/airflow/data/screenshots"
+ 
+SALES_CSV_PATH         = f"{DATA_DIR}/Sales_Invoices_Report_YTD.csv"
+CUSTOMER_WISE_CSV_PATH = f"{DATA_DIR}/Customer_Wise.csv"
+COLLECTION_CSV_PATH    = f"{DATA_DIR}/Collected_Invoice_Ageing_Report_YTD.csv"
+DEBTORS_CSV_PATH       = f"{DATA_DIR}/Debtors_Ageing_Summary_Report_YTD.csv"
+ 
+ 
+# ── Extract helpers ───────────────────────────────────────────────────────────
+ 
+def _setup():
+    from pathlib import Path
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(SCREENSHOTS_DIR).mkdir(parents=True, exist_ok=True)
+    os.system(f"chmod -R 777 {DATA_DIR}")
+ 
+ 
+def extract_sales(**ctx):
+    from pathlib import Path
+    from Sales_invoices_ytd_extract import ERPAutomation
+    _setup()
+    log.info("🚀 extract_sales")
+    ERPAutomation(
+        username=os.getenv("ERP_USERNAME", "M.Shehata"),
+        password=os.getenv("ERP_PASSWORD", "mostafa@1234"),
+        headless=True,
+    ).run()
+    if not Path(SALES_CSV_PATH).exists():
+        raise FileNotFoundError(f"Sales CSV not found: {SALES_CSV_PATH}")
+    log.info("✅ extract_sales done")
+ 
+ 
+def extract_customer_wise(**ctx):
+    from pathlib import Path
+    from Customer_Wise_extract import ERPAutomation
+    _setup()
+    log.info("🚀 extract_customer_wise")
+    ERPAutomation(
+        username=os.getenv("ERP_USERNAME_CW", os.getenv("ERP_USERNAME", "ar.ahmed")),
+        password=os.getenv("ERP_PASSWORD_CW", os.getenv("ERP_PASSWORD", "Ahmed@1234")),
+        headless=True,
+    ).run()
+    if not Path(CUSTOMER_WISE_CSV_PATH).exists():
+        raise FileNotFoundError(f"Customer Wise CSV not found: {CUSTOMER_WISE_CSV_PATH}")
+    log.info("✅ extract_customer_wise done")
+ 
+ 
+def extract_collection(**ctx):
+    from pathlib import Path
+    from Collected_invoice_ageing_ytd_extract import ERPAutomation
+    _setup()
+    log.info("🚀 extract_collection")
+    ERPAutomation(
+        username=os.getenv("ERP_USERNAME", "M.Shehata"),
+        password=os.getenv("ERP_PASSWORD", "mostafa@1234"),
+        headless=True,
+    ).run()
+    if not Path(COLLECTION_CSV_PATH).exists():
+        raise FileNotFoundError(f"Collection CSV not found: {COLLECTION_CSV_PATH}")
+    log.info("✅ extract_collection done")
+ 
+ 
+def extract_debtors(**ctx):
+    from pathlib import Path
+    from Debtors_ageing_ytd_extract import ERPAutomation
+    _setup()
+    log.info("🚀 extract_debtors")
+    ERPAutomation(
+        username=os.getenv("ERP_USERNAME", "M.Shehata"),
+        password=os.getenv("ERP_PASSWORD", "mostafa@1234"),
+        headless=True,
+    ).run()
+    if not Path(DEBTORS_CSV_PATH).exists():
+        raise FileNotFoundError(f"Debtors CSV not found: {DEBTORS_CSV_PATH}")
+    log.info("✅ extract_debtors done")
+ 
+ 
+# ── DAG ───────────────────────────────────────────────────────────────────────
+ 
+with DAG(
+    dag_id="erp_reports_full_etl",
+    description="ERP ETL — Extract → Transform → Load PostgreSQL",
+    default_args=default_args,
+    start_date=days_ago(1),
+    schedule_interval="0 */3 * * *",
+    catchup=False,
+    tags=["etl", "salman", "warehouse"],
+) as dag:
+ 
+    # ── Extract ───────────────────────────────────────────────────────────────
+    t_extract_sales = PythonOperator(
+        task_id="extract_sales", python_callable=extract_sales)
+ 
+    t_extract_customer_wise = PythonOperator(
+        task_id="extract_customer_wise", python_callable=extract_customer_wise)
+ 
+    t_extract_collection = PythonOperator(
+        task_id="extract_collection", python_callable=extract_collection,
+        doc_md="Collected Invoice Ageing — extracted for reference")
+ 
+    t_extract_debtors = PythonOperator(
+        task_id="extract_debtors", python_callable=extract_debtors,
+        doc_md="Debtors Ageing Summary — feeds fact_debtors_ageing")
+ 
+    # ── Transform Facts ───────────────────────────────────────────────────────
+    t_transform_sales = PythonOperator(
+        task_id="transform_sales", python_callable=transform_sales)
+ 
+    t_transform_collection = PythonOperator(
+        task_id="transform_collection", python_callable=transform_collection_airflow)
+ 
+    t_transform_debtors = PythonOperator(
+        task_id="transform_debtors",
+        python_callable=transform_debtors_ageing_airflow,
+        doc_md="Transforms Debtors Ageing CSV → fact_debtors_ageing.csv")
+ 
+    # ── Transform Collected Invoice Ageing (new) ──────────────────────────────
+    t_transform_collected_ageing = PythonOperator(
+        task_id="transform_collected_ageing",
+        python_callable=transform_collected_ageing_airflow,
+        doc_md="Transforms Collected Invoice Ageing CSV → fact_collected_ageing.csv"
+    )
+ 
+    # ── Transform Monthly Attributes (new) ────────────────────────────────────
+    t_transform_customer_monthly = PythonOperator(
+        task_id="transform_customer_monthly_attributes",
+        python_callable=transform_customer_monthly_airflow,
+        doc_md="Builds dim_sales_and_collection_assignment CSV (acc_manager + collector)"
+    )
+ 
+    # ── Build Dimensions ──────────────────────────────────────────────────────
+    t_download_customer_master = PythonOperator(
+        task_id="download_customer_master", python_callable=download_customer_master)
+ 
+    t_build_dim_customer = PythonOperator(
+        task_id="build_dim_customer", python_callable=build_dim_customer)
+ 
+    t_build_dim_date = PythonOperator(
+        task_id="build_dim_date", python_callable=build_dim_date_airflow)
+ 
+    t_download_item_master = PythonOperator(
+        task_id="download_item_master", python_callable=download_item_master)
+ 
+    t_build_dim_item = PythonOperator(
+        task_id="build_dim_item", python_callable=build_dim_item)
+    t_download_warehouse_master = PythonOperator(
+       task_id="download_warehouse_master", python_callable=download_warehouse_master)
+    t_download_customer_monthly_attributes = PythonOperator(
+       task_id="download_customer_monthly_attributes", python_callable=download_customer_monthly_attributes)
+ 
+    # ── Load ──────────────────────────────────────────────────────────────────
+    t_load_dimensions = PythonOperator(
+        task_id="load_dimensions", python_callable=load_dimensions,
+        doc_md="UPSERT for dim_date, dim_customer, dim_item, dim_warehouse, dim_sales_and_collection_assignment")
+ 
+    t_load_fact_sales = PythonOperator(
+        task_id="load_fact_sales", python_callable=load_fact_sales,
+        doc_md="Chunked UPSERT fact_sales_lines — PK: (date_key, inv_no, icode, ...)")
+ 
+    t_load_fact_collection = PythonOperator(
+        task_id="load_fact_collection", python_callable=load_fact_collection,
+        doc_md="Chunked UPSERT fact_collection — PK: (date_key, acode, supplier_code)")
+ 
+    t_load_fact_debtors = PythonOperator(
+        task_id="load_fact_debtors", python_callable=load_fact_debtors,
+        doc_md="Chunked UPSERT fact_debtors_ageing — PK: (client_code, supplier_code, payment_term)")
+ 
+    t_load_fact_collected_ageing = PythonOperator(
+        task_id="load_fact_collected_ageing", python_callable=load_fact_collected_ageing,
+        doc_md="Chunked UPSERT fact_collected_ageing — PK: (client_code, supplier_code, inv_no, collection_term)")
+ 
+    # ── Standalone Report (مستقل — بدون علاقات بأي pipeline تاني) ────────────
+    t_download_standalone_report = PythonOperator(
+        task_id="download_standalone_report",
+        python_callable=download_standalone_report,
+        doc_md="Download standalone_report.csv from Google Sheets")
+ 
+    t_load_standalone_report = PythonOperator(
+        task_id="load_standalone_report",
+        python_callable=transform_and_load_standalone,
+        doc_md="Full refresh dim_standalone_report — no FK constraints")
+ 
+    # ── Dependencies ──────────────────────────────────────────────────────────
+    #
+    # ① Sales pipeline
+    t_extract_sales >> t_transform_sales
+    t_download_warehouse_master >> t_transform_sales
+    #
+    # ② Collection pipeline (customer_wise needs collection + debtors first)
+    t_extract_sales >> t_extract_collection >> t_extract_debtors >> t_extract_customer_wise >> t_transform_collection
+    t_download_warehouse_master >> t_extract_collection
+    #
+    # ③ Debtors pipeline (runs after debtors extract)
+    t_extract_debtors >> t_transform_debtors
+    #
+    # ④ Collected Invoice Ageing pipeline (runs after collection extract)
+    t_extract_collection >> t_transform_collected_ageing
+    #
+    # ⑤ Build dims from transformed sales
+    t_transform_sales >> [t_build_dim_customer, t_build_dim_date, t_build_dim_item]
+    #
+    # ⑥ Collection + Debtors also feed dim_customer
+    t_transform_collection >> t_build_dim_customer
+    t_transform_debtors    >> t_build_dim_customer
+ 
+    t_download_customer_monthly_attributes >> t_transform_customer_monthly
+    #
+    # ⑦ Master data enriches dims
+    t_download_customer_master >> t_build_dim_customer
+    t_download_item_master     >> t_build_dim_item
+ 
+    #
+    # ⑧ Transform monthly attributes must happen before load_dimensions (it produces CSV)
+    t_transform_customer_monthly >> t_load_dimensions
+    #
+    # ⑨ Load dims after ALL dims are built (including monthly)
+    [t_build_dim_customer, t_build_dim_date, t_build_dim_item] >> t_load_dimensions
+    #
+    # ⑩ Load facts after dims are loaded (FK safety)
+    t_transform_collected_ageing >> t_load_dimensions      >> [t_load_fact_sales, t_load_fact_collection, t_load_fact_debtors, t_load_fact_collected_ageing]
+    # ── Standalone Report — مستقل تماماً عن باقي الـ pipeline ────────────────
+    # بيشتغل بالتوازي مع أي حاجة تانية — مفيش dependencies
+    t_download_standalone_report >> t_load_standalone_report

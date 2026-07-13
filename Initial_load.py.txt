@@ -1,0 +1,1343 @@
+from __future__ import annotations
+import argparse
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from typing import Optional
+import csv
+import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
+
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+DB_CONN     = os.getenv("WAREHOUSE_DB_CONN", "postgresql+psycopg2://salman:salman@postgres:5432/salman_db")
+DATA_DIR    = Path(os.getenv("DATA_DIR", "/opt/airflow/data"))
+CHUNK_SIZE  = int(os.getenv("CHUNK_SIZE", "5000"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+DRY_RUN     = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
+
+WAREHOUSE_MASTER     = DATA_DIR / "warehouse_master.csv"
+ITEM_MASTER_PATH     = DATA_DIR / "Item_Master_Report.csv"
+CUSTOMER_MASTER_PATH = DATA_DIR / "Customer_Master_Report.csv"
+
+YEARS = [2024, 2025]
+
+INTERCOMPANY = {
+    "1009996", "2001388", "1003155", "2000810", "1004327",
+    "1008778", "2002498", "1000711", "2002682", "1007987",
+}
+
+UPSERT_KEYS = {
+    "fact_sales_lines": ["date_key", "inv_no", "icode", "order_no", "da_no", "cust_code", "morder"],
+    "fact_collection":  ["date_key", "acode", "supplier_code"],
+    "fact_collected_ageing": ["client_code", "supplier_code", "inv_no", "collection_term"],
+}
+
+MONTH_LAST_DAY = {
+    "JAN": (1,31), "FEB": (2,28), "MAR": (3,31), "APRIL": (4,30),
+    "MAY": (5,31), "JUNE": (6,30), "JULY": (7,31), "AUGUST": (8,31),
+    "SEPT": (9,30), "OCT": (10,31), "NOV": (11,30), "DEC": (12,31),
+}
+
+FACT_COLS = {
+    "fact_sales_lines": [
+        "date_key", "inv_no", "icode", "inv_dated", "cust_code",
+        "supplier_code", "cust_branch_key", "inv_quantity", "inv_rate",
+        "inv_amount", "tax_amount", "line_total", "bill_total",
+        "inv_wt_tons", "tot_pkgs", "order_no", "da_no", "morder",
+        "assignment_key",
+    ],
+    "fact_collection": [
+        "date_key", "calendar_date", "month_name", "acode",
+        "supplier_code", "branchcd", "cust_branch_key",
+        "customer_code", "name", "collection_amount",
+        "assignment_key",
+    ],
+    "fact_collected_ageing": [
+        "client_code", "supplier_code", "inv_no", "collection_term", "collection_value",
+        "cust_branch_key", "client_name", "branchcd",
+        "inv_date", "inv_amount", "total_collected",
+        "due_date", "payment_date", "payment_date_key", "month_key", "assignment_key",
+    ],
+}
+
+NUMERIC_COLS = {
+    "fact_sales_lines": [
+        "inv_quantity", "inv_rate", "inv_amount", "tax_amount",
+        "line_total", "bill_total", "inv_wt_tons", "tot_pkgs",
+    ],
+    "fact_collection": ["collection_amount"],
+    "fact_collected_ageing": ["collection_value", "inv_amount", "total_collected"],
+}
+
+DROP_COLS = {
+    "fact_sales_lines": [
+        "inv_type", "sales_rep", "partcode", "vehicle_no", "foc_filter",
+        "consignee", "da_inv_tat", "dt_sort", "vchnum", "comp", "model",
+        "tpt_name", "transport", "inv_type_name", "ent_by", "ent_dt",
+        "freight", "cust_po_no", "month", "year", "quarter", "unit_ref",
+    ],
+    "fact_collection": ["sale_rep", "rep", "unit_ref"],
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ── CLEANING & HELPERS ──────────────────────────────────────────────────────
+
+def _extract_clean_key(value) -> str:
+    if pd.isna(value):
+        return ""
+    s = str(value).strip()
+    if not s or s in ("-", ".", "..", "", "nan", "None"):
+        return ""
+    numbers = re.findall(r'\d+', s)
+    if numbers:
+        return numbers[-1]
+    cleaned = re.sub(r'[\s\-]+', ' ', s).strip()
+    return cleaned
+
+
+def _clean_malformed_keys(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            original = df[col].copy()
+            df[col] = df[col].apply(_extract_clean_key)
+            changed = (original != df[col]).sum()
+            if changed:
+                log.info(f"   🧹 Cleaned {changed:,} malformed values in column '{col}'")
+    return df
+
+
+def _read_csv(path: Path) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(path, "r", encoding=enc) as f:
+                reader  = csv.reader(f)
+                header  = next(reader)
+                expected = len(header)
+                rows = []
+                for row in reader:
+                    if len(row) == expected:
+                        rows.append(row)
+                    elif len(row) > expected:
+                        rows.append(row[:expected-1] + [" ".join(row[expected-1:])])
+                    else:
+                        rows.append(row + [""] * (expected - len(row)))
+            df = pd.DataFrame(rows, columns=header)
+            df.columns = [c.strip().lower() for c in df.columns]
+            df = df.rename(columns={"inv_number": "inv_no", "account": "customer_code"})
+            log.info(f"   📂 {path.name} → {len(df):,} rows  (enc={enc})")
+            return df
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot read {path}")
+
+
+def _clean(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+
+
+def _to_numeric(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    for col in NUMERIC_COLS.get(table, []):
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce",
+            ).fillna(0)
+    return df
+
+
+def _find_col(columns: list, candidates: set) -> Optional[str]:
+    s = {c.lower() for c in candidates}
+    return next((c for c in columns if c.lower() in s), None)
+
+
+def _retry(fn, *args, retries: int = MAX_RETRIES, **kwargs):
+    for attempt in range(1, retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except OperationalError as e:
+            if attempt == retries:
+                raise
+            wait = attempt * 2
+            log.warning(f"   ⚡ DB error (attempt {attempt}/{retries}) — retry in {wait}s: {e}")
+            time.sleep(wait)
+
+
+def _row_count(engine, table: str) -> int:
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text(f'SELECT COUNT(*) FROM "{table}"')).scalar()
+    except Exception:
+        return 0
+
+
+def _get_existing_keys(engine, table: str, pk_col: str) -> set:
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(f'SELECT "{pk_col}" FROM "{table}"'))
+            return {str(r[0]).strip() for r in rows if r[0] is not None}
+    except Exception:
+        return set()
+
+
+# ── MASTER LOADERS ──────────────────────────────────────────────────────────
+
+_item_master_df:      Optional[pd.DataFrame] = None
+_warehouse_master_df: Optional[pd.DataFrame] = None
+_customer_master_df:  Optional[pd.DataFrame] = None
+
+
+def _load_item_master() -> pd.DataFrame:
+    global _item_master_df
+    if _item_master_df is not None:
+        return _item_master_df
+
+    if not ITEM_MASTER_PATH.exists():
+        log.warning(f"⚠️  Item Master not found: {ITEM_MASTER_PATH}")
+        _item_master_df = pd.DataFrame(columns=["item_code","item_name","sub_group","brand"])
+        return _item_master_df
+
+    df   = _read_csv(ITEM_MASTER_PATH)
+    cols = df.columns.tolist()
+
+    code_col  = _find_col(cols, {"itemno","item_no","icode","item_code","itemcode"})
+    name_col  = _find_col(cols, {"itemnamea","item_name","itemname"})
+    subg_col  = _find_col(cols, {"sub brand","sub_brand","subbrand","sub_grp_name","sub grp name"})
+    brand_col = _find_col(cols, {"masterbrand","master_brand","brand"})
+
+    if not code_col or not name_col:
+        log.warning("⚠️  Cannot detect code/name columns in Item Master — enrichment disabled")
+        _item_master_df = pd.DataFrame(columns=["item_code","item_name","sub_group","brand"])
+        return _item_master_df
+
+    rn = {code_col: "item_code", name_col: "item_name"}
+    if subg_col:  rn[subg_col]  = "sub_group"
+    if brand_col: rn[brand_col] = "brand"
+    df = df.rename(columns=rn)
+    for c in ("sub_group","brand"):
+        if c not in df.columns: df[c] = ""
+
+    df["item_code"] = df["item_code"].astype(str).str.strip()
+    _item_master_df = df[["item_code","item_name","sub_group","brand"]].drop_duplicates("item_code")
+    log.info(f"   📦 Item Master loaded: {len(_item_master_df):,} items")
+    return _item_master_df
+
+
+def _load_warehouse_master() -> pd.DataFrame:
+    global _warehouse_master_df
+    if _warehouse_master_df is not None:
+        return _warehouse_master_df
+
+    if not WAREHOUSE_MASTER.exists():
+        log.warning(f"⚠️  warehouse_master.csv not found")
+        _warehouse_master_df = pd.DataFrame(columns=["supplier_code","supplier_name","sub_supplier","comments"])
+        return _warehouse_master_df
+
+    df = pd.read_csv(WAREHOUSE_MASTER, dtype=str, encoding="latin1")
+    df.columns = df.columns.str.strip().str.lower()
+
+    rn = {}
+    for target, candidates in [
+        ("supplier_code", ["supplier_code","suppliercode","code"]),
+        ("supplier_name", ["supplier_name","suppliername","name"]),
+        ("sub_supplier",  ["sub_supplier","subsupplier","sub supplier"]),
+        ("comments",      ["comments","commetns","comment"]),
+    ]:
+        if target not in df.columns:
+            found = next((c for c in df.columns if c in candidates), None)
+            if found: rn[found] = target
+    if rn: df = df.rename(columns=rn)
+
+    for c in ("supplier_code","supplier_name","sub_supplier","comments"):
+        if c not in df.columns: df[c] = ""
+
+    df["supplier_code"] = df["supplier_code"].astype(str).str.strip().str.replace(r"\.0$","",regex=True)
+    _warehouse_master_df = df[["supplier_code","supplier_name","sub_supplier","comments"]].drop_duplicates("supplier_code")
+    log.info(f"   📦 Warehouse Master loaded: {len(_warehouse_master_df):,} entries")
+    return _warehouse_master_df
+
+
+def _load_customer_master() -> pd.DataFrame:
+    global _customer_master_df
+    if _customer_master_df is not None:
+        return _customer_master_df
+
+    if not CUSTOMER_MASTER_PATH.exists():
+        log.warning(f"⚠️  Customer_Master_Report.csv not found")
+        _customer_master_df = pd.DataFrame(columns=[
+            "customer_branch_code","customer_code","customer_name","supplier_code","branchcd"
+        ])
+        return _customer_master_df
+
+    df   = _read_csv(CUSTOMER_MASTER_PATH)
+    cols = df.columns.tolist()
+
+    branch_col = _find_col(cols, {"customer branch code","customer_branch_code","branch_code"})
+    code_col   = _find_col(cols, {"customerid","cust_code","customer_code","custcode"})
+    name_col   = _find_col(cols, {"customername","cust_name","customer_name","customer"})
+    sup_col    = _find_col(cols, {"vendor_code","supplier_code"})
+    br_col     = _find_col(cols, {"br_code","branchcd","branch"})
+
+    if not branch_col or not code_col or not name_col:
+        log.warning("⚠️  Cannot detect required columns in Customer Master — enrichment disabled")
+        _customer_master_df = pd.DataFrame(columns=[
+            "customer_branch_code","customer_code","customer_name","supplier_code","branchcd"
+        ])
+        return _customer_master_df
+
+    rn = {branch_col: "customer_branch_code", code_col: "customer_code", name_col: "customer_name"}
+    if sup_col: rn[sup_col] = "supplier_code"
+    if br_col:  rn[br_col]  = "branchcd"
+    df = df.rename(columns=rn)
+    for c in ("supplier_code","branchcd"):
+        if c not in df.columns: df[c] = ""
+
+    df["customer_branch_code"] = df["customer_branch_code"].astype(str).str.strip().str.replace(r"\.0$","",regex=True)
+    _customer_master_df = df[[
+        "customer_branch_code","customer_code","customer_name","supplier_code","branchcd"
+    ]].drop_duplicates("customer_branch_code")
+    log.info(f"   📦 Customer Master loaded: {len(_customer_master_df):,} entries")
+    return _customer_master_df
+
+
+def _load_supplier_map() -> dict:
+    wm = _load_warehouse_master()
+    if wm.empty or "sub_supplier" not in wm.columns:
+        return {}
+    mapping = (
+        wm[["sub_supplier","supplier_code"]]
+        .dropna(subset=["sub_supplier"])
+        .set_index("sub_supplier")["supplier_code"]
+        .to_dict()
+    )
+    log.info(f"   🗺️  Supplier map: {len(mapping)} entries")
+    return mapping
+
+
+# ── DIM BUILDERS ─────────────────────────────────────────────────────────────
+
+def _build_and_insert_dim_date(engine, fact_df: pd.DataFrame, dry_run: bool) -> None:
+    if "date_key" not in fact_df.columns:
+        return
+
+    all_keys = set(fact_df["date_key"].dropna().astype(str).str.strip().unique()) - {"", "nan", "0", "None"}
+    existing = _get_existing_keys(engine, "dim_date", "date_key")
+    missing = all_keys - existing
+
+    if not missing:
+        log.info(f"   ✅ dim_date — all {len(all_keys):,} date_keys already in DB, nothing to insert")
+        return
+
+    log.info(f"   🔧 dim_date — deriving {len(missing):,} new dates from fact data ...")
+
+    date_mapping = {}
+    if "inv_dated" in fact_df.columns:
+        for _, row in fact_df.iterrows():
+            dk = str(row.get("date_key", "")).strip()
+            if dk in missing:
+                inv_dated = row.get("inv_dated")
+                if pd.notna(inv_dated) and inv_dated:
+                    try:
+                        dt = pd.to_datetime(inv_dated, format="mixed", errors="coerce")
+                        if pd.notna(dt):
+                            date_mapping[dk] = dt.normalize()
+                    except:
+                        pass
+
+    for dk in missing:
+        if dk not in date_mapping:
+            try:
+                dt = pd.to_datetime(str(dk), format="%Y%m%d", errors="coerce")
+                if pd.notna(dt):
+                    date_mapping[dk] = dt.normalize()
+            except:
+                pass
+
+    rows = []
+    skipped = 0
+    for key_str in sorted(missing):
+        dt = date_mapping.get(key_str)
+        if dt is None:
+            skipped += 1
+            continue
+        
+        key_int = int(key_str)
+        rows.append({
+            "date_key": key_int,
+            "date": dt.date(),
+            "year": dt.year,
+            "monthnum": dt.month,
+            "month": dt.strftime("%b"),
+            "monthlong": dt.strftime("%B"),
+            "quarter": f"Q{(dt.month - 1) // 3 + 1}",
+            "fiscalyear": f"FY{dt.year}",
+            "fiscalmonth": dt.strftime("%b"),
+            "fiscalquarter": f"FQ{(dt.month - 1) // 3 + 1}",
+            "weekdaynum": dt.weekday(),
+            "weekday": dt.strftime("%A"),
+            "dayofyear": dt.dayofyear,
+            "weekofyear": int(dt.isocalendar().week),
+            "weekofmonth": (dt.day - 1) // 7 + 1,
+            "monthyearnum": int(dt.strftime("%Y%m")),
+            "monthyear": dt.strftime("%b%Y"),
+            "monthyearlong": dt.strftime("%B %Y"),
+            "is_friday": int(dt.weekday() == 4),
+            "is_holiday": 0,
+            "is_working_day": int(dt.weekday() < 5),
+        })
+
+    if skipped:
+        log.warning(f"   ⚠️  Skipped {skipped:,} invalid date_keys (no valid date found)")
+
+    if dry_run:
+        log.info(f"   🔍 DRY RUN — would insert {len(rows):,} rows into dim_date")
+        return
+
+    if not rows:
+        return
+
+    new_df = pd.DataFrame(rows)
+    new_df["date"] = pd.to_datetime(new_df["date"], errors="coerce").dt.date
+
+    with engine.begin() as conn:
+        new_df.to_sql("_tmp_dim_date", conn, if_exists="replace", index=False, method="multi")
+        conn.execute(text("""
+            INSERT INTO dim_date (
+                date_key, date, year, monthnum, month, monthlong, quarter,
+                fiscalyear, fiscalmonth, fiscalquarter,
+                weekdaynum, weekday, dayofyear, weekofyear, weekofmonth,
+                monthyearnum, monthyear, monthyearlong,
+                is_friday, is_holiday, is_working_day
+            )
+            SELECT
+                date_key, date, year, monthnum, month, monthlong, quarter,
+                fiscalyear, fiscalmonth, fiscalquarter,
+                weekdaynum, weekday, dayofyear, weekofyear, weekofmonth,
+                monthyearnum, monthyear, monthyearlong,
+                is_friday, is_holiday, is_working_day
+            FROM _tmp_dim_date
+            ON CONFLICT (date_key) DO NOTHING
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_dim_date"))
+    log.info(f"   ✅ dim_date — inserted {len(rows):,} new rows")
+
+
+def _ensure_dim_date_keys_from_ageing(engine, df: pd.DataFrame, dry_run: bool) -> None:
+    if "payment_date_key" not in df.columns:
+        return
+    keys = df["payment_date_key"].dropna().astype(int).unique()
+    if len(keys) == 0:
+        return
+    temp_df = pd.DataFrame({"date_key": keys})
+    _build_and_insert_dim_date(engine, temp_df, dry_run)
+
+
+def _build_and_insert_dim_item(engine, fact_df: pd.DataFrame, dry_run: bool) -> None:
+    if "icode" not in fact_df.columns:
+        return
+
+    all_codes = set(fact_df["icode"].dropna().astype(str).str.strip().unique()) - {"", "nan", "None", "UNKNOWN"}
+    existing = _get_existing_keys(engine, "dim_item", "item_code")
+    missing = all_codes - existing
+
+    if not missing:
+        log.info(f"   ✅ dim_item — all {len(all_codes):,} icodes already in DB, nothing to insert")
+        return
+
+    log.info(f"   🔧 dim_item — {len(missing):,} new icodes to insert ...")
+
+    item_name_map = {}
+    if "item_name" in fact_df.columns:
+        for _, row in fact_df.iterrows():
+            code = str(row.get("icode", "")).strip()
+            if code in missing:
+                name = str(row.get("item_name", "")).strip()
+                if name and name not in ("", "nan", "None"):
+                    item_name_map[code] = name
+
+    master = _load_item_master()
+    master_idx = master.set_index("item_code") if not master.empty else pd.DataFrame()
+
+    rows = []
+    from_master = 0
+    from_fact = 0
+    from_fallback = 0
+
+    for code in sorted(missing):
+        if not master_idx.empty and code in master_idx.index:
+            row = master_idx.loc[code]
+            rows.append({
+                "item_code": code,
+                "item_name": str(row.get("item_name", code)).strip() or code,
+                "sub_group": str(row.get("sub_group", "")).strip(),
+                "brand": str(row.get("brand", "")).strip(),
+            })
+            from_master += 1
+        elif code in item_name_map:
+            rows.append({
+                "item_code": code,
+                "item_name": item_name_map[code],
+                "sub_group": "",
+                "brand": "",
+            })
+            from_fact += 1
+        else:
+            rows.append({
+                "item_code": code,
+                "item_name": code,
+                "sub_group": "",
+                "brand": "",
+            })
+            from_fallback += 1
+
+    log.info(f"      Enriched from Item Master CSV : {from_master:,}")
+    log.info(f"      Enriched from fact item_name   : {from_fact:,}")
+    log.info(f"      Code used as name (fallback)   : {from_fallback:,}")
+
+    if dry_run:
+        log.info(f"   🔍 DRY RUN — would insert {len(rows):,} rows into dim_item")
+        return
+
+    new_df = pd.DataFrame(rows)
+    with engine.begin() as conn:
+        new_df.to_sql("_tmp_dim_item", conn, if_exists="replace", index=False, method="multi")
+        conn.execute(text("""
+            INSERT INTO dim_item (item_code, item_name, sub_group, brand)
+            SELECT item_code, item_name, sub_group, brand FROM _tmp_dim_item
+            ON CONFLICT (item_code) DO NOTHING
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_dim_item"))
+    log.info(f"   ✅ dim_item — inserted {len(rows):,} new rows")
+
+
+def _build_and_insert_dim_warehouse(engine, *fact_dfs: pd.DataFrame, dry_run: bool) -> None:
+    all_codes: set = set()
+    for df in fact_dfs:
+        if df is not None and "supplier_code" in df.columns:
+            all_codes.update(df["supplier_code"].dropna().astype(str).str.strip().unique())
+    all_codes -= {"","nan","None","UNKNOWN"}
+
+    existing = _get_existing_keys(engine, "dim_warehouse", "supplier_code")
+    missing  = all_codes - existing
+
+    if not missing:
+        log.info(f"   ✅ dim_warehouse — all {len(all_codes):,} supplier_codes already in DB, nothing to insert")
+        return
+
+    log.info(f"   🔧 dim_warehouse — {len(missing):,} new supplier_codes to insert ...")
+
+    master    = _load_warehouse_master()
+    master_idx = master.set_index("supplier_code") if not master.empty else pd.DataFrame()
+
+    rows = []
+    from_master = 0
+    from_fallback = 0
+
+    for code in sorted(missing):
+        if not master_idx.empty and code in master_idx.index:
+            row = master_idx.loc[code]
+            rows.append({
+                "supplier_code": code,
+                "supplier_name": str(row.get("supplier_name", code)).strip() or code,
+                "sub_supplier": str(row.get("sub_supplier", "")).strip(),
+                "comments": str(row.get("comments", "")).strip(),
+            })
+            from_master += 1
+        else:
+            rows.append({
+                "supplier_code": code,
+                "supplier_name": code,
+                "sub_supplier": "",
+                "comments": "",
+            })
+            from_fallback += 1
+
+    log.info(f"      Enriched from Warehouse Master CSV : {from_master:,}")
+    log.info(f"      Code used as name (fallback)       : {from_fallback:,}")
+
+    if dry_run:
+        log.info(f"   🔍 DRY RUN — would insert {len(rows):,} rows into dim_warehouse")
+        return
+
+    new_df = pd.DataFrame(rows)
+    with engine.begin() as conn:
+        new_df.to_sql("_tmp_dim_wh", conn, if_exists="replace", index=False, method="multi")
+        conn.execute(text("""
+            INSERT INTO dim_warehouse (supplier_code, supplier_name, sub_supplier, comments)
+            SELECT supplier_code, supplier_name, sub_supplier, comments FROM _tmp_dim_wh
+            ON CONFLICT (supplier_code) DO NOTHING
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_dim_wh"))
+    log.info(f"   ✅ dim_warehouse — inserted {len(rows):,} new rows")
+
+
+def _build_and_insert_dim_customer(
+    engine,
+    sales_df: Optional[pd.DataFrame],
+    coll_df: Optional[pd.DataFrame],
+    dry_run: bool,
+    ageing_df: Optional[pd.DataFrame] = None,
+) -> None:
+    keys: set = set()
+    for df in (sales_df, coll_df, ageing_df):
+        if df is not None and "cust_branch_key" in df.columns:
+            keys.update(df["cust_branch_key"].dropna().astype(str).str.strip().unique())
+    keys -= {"", "nan", "None", "UNKNOWN"}
+
+    existing = _get_existing_keys(engine, "dim_customer", "customer_branch_code")
+    missing = keys - existing
+
+    if not missing:
+        log.info(f"   ✅ dim_customer — all {len(keys):,} cust_branch_keys already in DB, nothing to insert")
+        return
+
+    log.info(f"   🔧 dim_customer — {len(missing):,} new cust_branch_keys to insert ...")
+
+    cust_name_map = {}
+    if sales_df is not None and "cust_branch_key" in sales_df.columns:
+        for _, row in sales_df.iterrows():
+            key = str(row.get("cust_branch_key", "")).strip()
+            if key in missing:
+                cust_name = ""
+                if "customer" in row.index and pd.notna(row.get("customer")):
+                    cust_name = str(row.get("customer")).strip()
+                elif "customer_name" in row.index and pd.notna(row.get("customer_name")):
+                    cust_name = str(row.get("customer_name")).strip()
+                elif "cust_code" in row.index and pd.notna(row.get("cust_code")):
+                    cust_name = str(row.get("cust_code")).strip()
+                if cust_name and cust_name not in ("", "nan", "None", "UNKNOWN"):
+                    cust_name_map[key] = cust_name
+
+    if coll_df is not None and "cust_branch_key" in coll_df.columns:
+        for _, row in coll_df.iterrows():
+            key = str(row.get("cust_branch_key", "")).strip()
+            if key in missing and key not in cust_name_map:
+                if "customer_code" in row.index and pd.notna(row.get("customer_code")):
+                    cust_name = str(row.get("customer_code")).strip()
+                    if cust_name and cust_name not in ("", "nan", "None", "UNKNOWN"):
+                        cust_name_map[key] = cust_name
+                elif "name" in row.index and pd.notna(row.get("name")):
+                    cust_name = str(row.get("name")).strip()
+                    if cust_name and cust_name not in ("", "nan", "None", "UNKNOWN"):
+                        cust_name_map[key] = cust_name
+
+    master = _load_customer_master()
+    master_idx = master.set_index("customer_branch_code") if not master.empty else pd.DataFrame()
+
+    rows = []
+    from_master = 0
+    from_fact = 0
+    from_fallback = 0
+
+    for key in sorted(missing):
+        if not master_idx.empty and key in master_idx.index:
+            row = master_idx.loc[key]
+            rows.append({
+                "customer_branch_code": key,
+                "customer_code": str(row.get("customer_code", key)).strip() or key,
+                "customer_name": str(row.get("customer_name", key)).strip() or key,
+                "supplier_code": str(row.get("supplier_code", "")).strip(),
+                "branchcd": str(row.get("branchcd", "")).strip(),
+            })
+            from_master += 1
+        elif key in cust_name_map:
+            rows.append({
+                "customer_branch_code": key,
+                "customer_code": key,
+                "customer_name": cust_name_map[key],
+                "supplier_code": "",
+                "branchcd": "",
+            })
+            from_fact += 1
+        else:
+            rows.append({
+                "customer_branch_code": key,
+                "customer_code": key,
+                "customer_name": key,
+                "supplier_code": "",
+                "branchcd": "",
+            })
+            from_fallback += 1
+
+    log.info(f"      Enriched from Customer Master CSV : {from_master:,}")
+    log.info(f"      Enriched from fact customer_name  : {from_fact:,}")
+    log.info(f"      Key used as name (fallback)       : {from_fallback:,}")
+
+    if dry_run:
+        log.info(f"   🔍 DRY RUN — would insert {len(rows):,} rows into dim_customer")
+        return
+
+    new_df = pd.DataFrame(rows)
+    with engine.begin() as conn:
+        new_df.to_sql("_tmp_dim_cust", conn, if_exists="replace", index=False, method="multi")
+        conn.execute(text("""
+            INSERT INTO dim_customer
+                (customer_branch_code, customer_code, customer_name, supplier_code, branchcd)
+            SELECT
+                customer_branch_code, customer_code, customer_name, supplier_code, branchcd
+            FROM _tmp_dim_cust
+            ON CONFLICT (customer_branch_code) DO NOTHING
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_dim_cust"))
+    log.info(f"   ✅ dim_customer — inserted {len(rows):,} new rows")
+
+
+# ── NORMALISATION FUNCTIONS ─────────────────────────────────────────────────
+
+def _normalise_sales(df: pd.DataFrame, supplier_map: dict) -> pd.DataFrame:
+    log.info("   🔧 Normalising fact_sales_lines ...")
+    df = _clean_malformed_keys(df, ["cust_branch_key", "cust_code", "supplier_code", "icode"])
+
+    if "unit_ref" in df.columns and "supplier_code" not in df.columns:
+        df["supplier_code"] = _clean(df["unit_ref"]).map(supplier_map)
+        unmapped = df["supplier_code"].isna().sum()
+        if unmapped:
+            log.warning(f"   ⚠️  {unmapped:,} unmapped unit_ref values")
+
+    df["supplier_code"] = _clean(df.get("supplier_code", pd.Series([""] * len(df))))
+    df["cust_code"]     = _clean(df.get("cust_code",     pd.Series([""] * len(df))))
+
+    before = len(df)
+    df     = df[~df["cust_code"].isin(INTERCOMPANY)].copy()
+    log.info(f"   🧹 Removed {before - len(df):,} intercompany rows")
+
+    if "cust_branch_key" not in df.columns:
+        df["cust_branch_key"] = df["cust_code"] + df["supplier_code"]
+    else:
+        df["cust_branch_key"] = df["cust_branch_key"].apply(_extract_clean_key)
+
+    if "date_key" not in df.columns:
+        if "inv_dated" not in df.columns:
+            raise ValueError("❌ Neither date_key nor inv_dated found in sales data")
+        inv_dt          = pd.to_datetime(df["inv_dated"], format="mixed", errors="coerce")
+        df["date_key"]  = inv_dt.dt.strftime("%Y%m%d").astype("Int64")
+        df["inv_dated"] = inv_dt.dt.strftime("%m/%d/%Y")
+
+    df["date_key"] = pd.to_numeric(df["date_key"], errors="coerce").fillna(0).astype(int)
+    df = _to_numeric(df, "fact_sales_lines")
+
+    for col in ["order_no", "da_no", "morder"]:
+        df[col] = df[col].fillna("MISSING").astype(str) if col in df.columns else "MISSING"
+
+    for col in ("icode", "supplier_code"):
+        if col in df.columns:
+            df[col] = (
+                df[col].astype(str).str.strip()
+                .replace(["", "None", "nan"], "UNKNOWN")
+                .fillna("UNKNOWN")
+            )
+
+    if "date_key" in df.columns and "cust_branch_key" in df.columns:
+        month_key_series = (df["date_key"] / 100).astype(int)
+        df["assignment_key"] = df["cust_branch_key"] + '_' + month_key_series.astype(str)
+
+    drop = [c for c in DROP_COLS["fact_sales_lines"] if c in df.columns]
+    df.drop(columns=drop, inplace=True, errors="ignore")
+    
+    log.info(f"   ✅ fact_sales_lines normalised | {len(df):,} rows")
+    return df
+
+
+def _normalise_collection(df: pd.DataFrame, supplier_map: dict, year: int) -> pd.DataFrame:
+    log.info(f"   🔧 Normalising fact_collection (year={year}) ...")
+    df = _clean_malformed_keys(df, ["acode", "supplier_code", "cust_branch_key"])
+
+    if "date_key" in df.columns and "acode" in df.columns:
+        log.info("   ℹ️  Pre-transformed format detected")
+        df["date_key"]      = pd.to_numeric(df["date_key"], errors="coerce").fillna(0).astype(int)
+        df["supplier_code"] = _clean(df.get("supplier_code", pd.Series([""] * len(df))))
+        df["acode"]         = _clean(df["acode"])
+        df = _to_numeric(df, "fact_collection")
+        allowed = FACT_COLS["fact_collection"]
+        df = df[[c for c in allowed if c in df.columns]].copy()
+        if "date_key" in df.columns and "cust_branch_key" in df.columns:
+            month_key_series = (df["date_key"] / 100).astype(int)
+            df["assignment_key"] = df["cust_branch_key"] + '_' + month_key_series.astype(str)
+        return df
+
+    if "rep" not in df.columns:
+        raise ValueError("❌ Cannot detect collection format: no 'rep' column")
+
+    df = df[df["rep"].str.strip() == "Collection"].copy()
+    log.info(f"   ✅ Filtered to {len(df):,} collection rows")
+
+    month_cols = ["jan","feb","mar","april","may","june","july","august","sept","oct","nov","dec"]
+    id_cols    = ["unit_ref","name","account","sale_rep","rep","acode","branchcd"]
+
+    df = df[
+        [c for c in id_cols    if c in df.columns] +
+        [c for c in month_cols if c in df.columns]
+    ].melt(
+        id_vars=[c for c in id_cols    if c in df.columns],
+        value_vars=[c for c in month_cols if c in df.columns],
+        var_name="month_name",
+        value_name="collection_amount",
+    )
+    df = _to_numeric(df, "fact_collection")
+
+    if "unit_ref" in df.columns:
+        df["supplier_code"] = _clean(df["unit_ref"]).map(supplier_map)
+        df.drop(columns=["unit_ref"], inplace=True)
+    else:
+        df["supplier_code"] = ""
+    df["supplier_code"] = _clean(df["supplier_code"])
+
+    df["branchcd"] = (
+        _clean(df["branchcd"]) if "branchcd" in df.columns
+        else pd.Series(["HO"] * len(df))
+    )
+    if "customer_code" in df.columns:
+        df["customer_code"] = _clean(df["customer_code"])
+
+    df["acode"]           = _clean(df["acode"]) if "acode" in df.columns else ""
+    df["cust_branch_key"] = df["acode"] + df["branchcd"]
+    df["cust_branch_key"] = df["cust_branch_key"].apply(_extract_clean_key)
+
+    mu = df["month_name"].str.upper()
+    df["date_key"] = mu.map(
+        lambda m: int(f"{year}{MONTH_LAST_DAY[m][0]:02d}{MONTH_LAST_DAY[m][1]:02d}")
+        if m in MONTH_LAST_DAY else 0
+    )
+    df["calendar_date"] = mu.map(
+        lambda m: f"{year}-{MONTH_LAST_DAY[m][0]:02d}-{MONTH_LAST_DAY[m][1]:02d}"
+        if m in MONTH_LAST_DAY else None
+    )
+    df["date_key"] = pd.to_numeric(df["date_key"], errors="coerce").fillna(0).astype(int)
+
+    if "date_key" in df.columns and "cust_branch_key" in df.columns:
+        month_key_series = (df["date_key"] / 100).astype(int)
+        df["assignment_key"] = df["cust_branch_key"] + '_' + month_key_series.astype(str)
+
+    drop = [c for c in DROP_COLS["fact_collection"] if c in df.columns]
+    df.drop(columns=drop, inplace=True, errors="ignore")
+    
+    allowed = FACT_COLS["fact_collection"]
+    df = df[[c for c in allowed if c in df.columns]].copy()
+    log.info(f"   ✅ fact_collection normalised | {len(df):,} rows")
+    return df
+
+
+def _normalise_collected_ageing(df: pd.DataFrame, supplier_map: dict) -> pd.DataFrame:
+    log.info("   🔧 Normalising fact_collected_ageing ...")
+    df.columns = df.columns.str.strip().str.lower()
+
+    HIST_RENAME = {
+        "vend_code":     "client_code",
+        "customer_name": "client_name",
+        "br_cd":         "supplier_code",
+        "inv_dtd":       "inv_date",
+        "due_dtd":       "due_date",
+        "pymt_dtd":      "payment_date",
+        "bill_amt":      "inv_amount",
+        "pymt_amt":      "total_collected",
+        "bkt_0_30":      "col_0_to_30",
+        "bkt_31_60":     "col_31_to_60",
+        "bkt_61_90":     "col_61_to_90",
+        "bkt_91_120":    "col_91_to_120",
+        "bkt_121_150":   "col_121_to_150",
+        "bkt_over_151":  "col_over_150",
+    }
+    actual_rename = {k: v for k, v in HIST_RENAME.items() if k in df.columns}
+    if actual_rename:
+        df.rename(columns=actual_rename, inplace=True)
+        log.info(f"   🔁 Historical rename applied: {actual_rename}")
+
+    COL_ALIASES_LOCAL = {
+        "client_code":     ["client_code", "cust_code", "account", "acode"],
+        "client_name":     ["client_name", "name", "customer_name"],
+        "inv_no":          ["inv_no", "invoice_no", "inv_number", "doc_no"],
+        "inv_date":        ["inv_date", "invoice_date", "inv_dated"],
+        "due_date":        ["due_date", "due_dtd"],
+        "payment_date":    ["payment_date", "pymt_dtd"],
+        "inv_amount":      ["inv_amount", "invoice_amount", "total_amount", "amount"],
+        "total_collected": ["total_collected", "collected_amount", "paid_amount"],
+        "branchcd":        ["branchcd", "br_code", "branch_code", "supplier_code"],
+    }
+
+    def resolve(cols, standard):
+        for alias in COL_ALIASES_LOCAL.get(standard, [standard]):
+            if alias in cols:
+                return alias
+        return None
+
+    if "client_code" in df.columns and "collection_term" in df.columns:
+        log.info("   ℹ️  Pre-transformed format detected for collected_ageing")
+        df["client_code"]     = _clean(df["client_code"])
+        df["supplier_code"]   = _clean(df.get("supplier_code", pd.Series([""] * len(df))))
+        df["branchcd"]        = df["supplier_code"].copy()
+        df["cust_branch_key"] = df["client_code"] + df["supplier_code"]
+        for col in ("collection_value", "inv_amount", "total_collected"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.replace(",", "", regex=False), errors="coerce"
+                ).fillna(0)
+        if "payment_date" in df.columns:
+            df["payment_date_key"] = pd.to_datetime(df["payment_date"], errors="coerce").dt.strftime("%Y%m%d").fillna("0").astype(int)
+            df["month_key"] = (df["payment_date_key"] // 100).astype(int)
+            df["assignment_key"] = df["cust_branch_key"] + "_" + df["month_key"].astype(str)
+        if "inv_no" not in df.columns:
+            df["inv_no"] = ""
+        allowed = FACT_COLS["fact_collected_ageing"]
+        df = df[[c for c in allowed if c in df.columns]].copy()
+        if "inv_no" not in df.columns:
+            df["inv_no"] = ""
+        log.info(f"   ✅ fact_collected_ageing normalised | {len(df):,} rows")
+        return df
+
+    if "supplier_code" not in df.columns:
+        br_src = resolve(df.columns.tolist(), "branchcd")
+        df["supplier_code"] = _clean(df[br_src]) if br_src else ""
+    df["supplier_code"] = _clean(df["supplier_code"])
+    df["branchcd"]      = df["supplier_code"].copy()
+
+    cc_src = resolve(df.columns.tolist(), "client_code")
+    df["client_code"] = _clean(df[cc_src]) if cc_src else ""
+    df["cust_branch_key"] = df["client_code"] + df["supplier_code"]
+
+    inv_src = resolve(df.columns.tolist(), "inv_no")
+    df["inv_no"] = _clean(df[inv_src]) if inv_src else ""
+
+    for target, aliases in [("inv_amount", ["inv_amount", "invoice_amount", "amount"]),
+                             ("total_collected", ["total_collected", "collected_amount"])]:
+        src = next((a for a in aliases if a in df.columns), None)
+        df[target] = pd.to_numeric(
+            df[src].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        ).fillna(0) if src else 0.0
+
+    for col in ("client_name", "inv_date", "due_date", "payment_date"):
+        src = resolve(df.columns.tolist(), col)
+        df[col] = df[src].astype(str).str.strip() if src else ""
+
+    df["payment_date_key"] = pd.to_datetime(df["payment_date"], errors="coerce").dt.strftime("%Y%m%d").fillna("0").astype(int)
+    df["month_key"]        = (df["payment_date_key"] // 100).astype(int)
+    df["assignment_key"]   = df["cust_branch_key"] + "_" + df["month_key"].astype(str)
+
+    bucket_prefixes = ["col_0_to_30", "col_31_to_60", "col_61_to_90",
+                       "col_91_to_120", "col_121_to_150", "col_over_150"]
+    for col in bucket_prefixes:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "", regex=False), errors="coerce"
+            ).fillna(0)
+
+    avail_buckets = [c for c in bucket_prefixes if c in df.columns]
+    if not avail_buckets:
+        log.warning("   ⚠️  No bucket columns found — cannot unpivot collected ageing")
+        return pd.DataFrame(columns=FACT_COLS["fact_collected_ageing"])
+
+    id_vars = [c for c in df.columns if c not in avail_buckets]
+    df = pd.melt(df, id_vars=id_vars, value_vars=avail_buckets,
+                 var_name="collection_term", value_name="collection_value")
+    df["collection_term"] = (
+        df["collection_term"].str.replace("col_", "", regex=False)
+        .str.replace("_", "-", regex=False)
+    )
+    df = df[df["collection_value"] != 0]
+
+    pk = UPSERT_KEYS["fact_collected_ageing"]
+    df = df.dropna(subset=pk)
+    df = df.drop_duplicates(subset=pk, keep="last")
+
+    allowed = FACT_COLS["fact_collected_ageing"]
+    df = df[[c for c in allowed if c in df.columns]].copy()
+    log.info(f"   ✅ fact_collected_ageing normalised | {len(df):,} rows")
+    return df
+
+
+# ── MONTHLY ASSIGNMENT HELPERS ──────────────────────────────────────────────
+
+def _ensure_monthly_assignments_from_df(engine, df: pd.DataFrame, table_type: str, dry_run: bool) -> None:
+    if table_type not in ("fact_sales_lines", "fact_collection"):
+        return
+    if "cust_branch_key" not in df.columns or "date_key" not in df.columns:
+        return
+    temp = df[["cust_branch_key", "date_key"]].copy()
+    temp = temp[temp["date_key"].notna() & (temp["date_key"] != 0)]
+    temp["month_key"] = (temp["date_key"].astype(int) / 100).astype(int)
+    temp["cust_branch_key"] = temp["cust_branch_key"].astype(str).str.strip()
+    temp["assignment_key"] = temp["cust_branch_key"] + '_' + temp["month_key"].astype(str)
+    pairs_df = temp[["cust_branch_key", "month_key", "assignment_key"]].drop_duplicates()
+
+    with engine.connect() as conn:
+        existing = pd.read_sql("SELECT assignment_key FROM dim_sales_and_collection_assignment", conn)
+    existing_set = set(existing["assignment_key"])
+
+    missing = pairs_df[~pairs_df["assignment_key"].isin(existing_set)].copy()
+    if missing.empty:
+        return
+    missing["year"] = missing["month_key"] // 100
+    missing["month"] = missing["month_key"] % 100
+    missing["month_start_date"] = pd.to_datetime(
+        missing["year"].astype(str) + "-" + missing["month"].astype(str) + "-01"
+    ).dt.date
+    default_rows = pd.DataFrame({
+        "assignment_key": missing["assignment_key"],
+        "customer_branch_code": missing["cust_branch_key"],
+        "month_key": missing["month_key"],
+        "month_start_date": missing["month_start_date"],
+        "acc_manager": "Not Assigned",
+        "collector": "Not Assigned"
+    })
+    if dry_run:
+        return
+    with engine.begin() as conn:
+        default_rows.to_sql("_tmp_missing_assign", conn, if_exists="replace", index=False, method="multi", chunksize=1000)
+        conn.execute(text("""
+            INSERT INTO dim_sales_and_collection_assignment
+                (assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector)
+            SELECT assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector
+            FROM _tmp_missing_assign
+            ON CONFLICT (assignment_key) DO NOTHING
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_missing_assign"))
+
+
+def _ensure_collected_ageing_assignments(engine, df: pd.DataFrame, dry_run: bool) -> None:
+    if "cust_branch_key" not in df.columns or "month_key" not in df.columns:
+        return
+    temp = df[["cust_branch_key", "month_key"]].copy()
+    temp = temp.dropna()
+    if temp.empty:
+        return
+    temp["cust_branch_key"] = temp["cust_branch_key"].astype(str).str.strip()
+    temp["assignment_key"] = temp["cust_branch_key"] + '_' + temp["month_key"].astype(int).astype(str)
+    pairs_df = temp[["cust_branch_key", "month_key", "assignment_key"]].drop_duplicates()
+
+    with engine.connect() as conn:
+        existing = pd.read_sql("SELECT assignment_key FROM dim_sales_and_collection_assignment", conn)
+    existing_set = set(existing["assignment_key"])
+
+    missing = pairs_df[~pairs_df["assignment_key"].isin(existing_set)].copy()
+    if missing.empty:
+        return
+
+    log.info(f"   🧩 Adding {len(missing)} default monthly assignments for fact_collected_ageing ...")
+
+    missing["year"] = missing["month_key"] // 100
+    missing["month"] = missing["month_key"] % 100
+    missing["month_start_date"] = pd.to_datetime(
+        missing["year"].astype(str) + "-" + missing["month"].astype(str) + "-01"
+    ).dt.date
+
+    default_rows = pd.DataFrame({
+        "assignment_key": missing["assignment_key"],
+        "customer_branch_code": missing["cust_branch_key"],
+        "month_key": missing["month_key"],
+        "month_start_date": missing["month_start_date"],
+        "acc_manager": "Not Assigned",
+        "collector": "Not Assigned"
+    })
+
+    if dry_run:
+        log.info(f"   🔍 DRY RUN — would insert {len(default_rows)} rows into dim_sales_and_collection_assignment")
+        return
+
+    with engine.begin() as conn:
+        default_rows.to_sql("_tmp_missing_assign_ca", conn, if_exists="replace", index=False, method="multi", chunksize=1000)
+        conn.execute(text("""
+            INSERT INTO dim_sales_and_collection_assignment
+                (assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector)
+            SELECT assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector
+            FROM _tmp_missing_assign_ca
+            ON CONFLICT (assignment_key) DO NOTHING
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_missing_assign_ca"))
+    log.info("   ✅ Default monthly assignments added for fact_collected_ageing.")
+
+
+# ── CHUNKED UPSERT ──────────────────────────────────────────────────────────
+
+def _upsert(engine, table: str, df: pd.DataFrame, dry_run: bool = False) -> int:
+    pk_cols    = UPSERT_KEYS[table]
+    missing_pk = [c for c in pk_cols if c not in df.columns]
+    if missing_pk:
+        raise KeyError(f"❌ PK columns missing in {table}: {missing_pk}")
+
+    before  = len(df)
+    df      = df.dropna(subset=pk_cols)
+    dropped = before - len(df)
+    if dropped:
+        log.warning(f"   ⚠️  Dropped {dropped:,} rows with NULL PK in {table}")
+
+    if dry_run:
+        log.info(f"   🔍 DRY RUN — would upsert {len(df):,} rows into {table}")
+        return len(df)
+
+    all_cols    = [c for c in df.columns if c != "month_key"]
+    update_cols = [c for c in all_cols if c not in pk_cols]
+    cols_q      = ", ".join(f'"{c}"' for c in all_cols)
+    conflict_q  = ", ".join(f'"{c}"' for c in pk_cols)
+    update_q    = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+    staging     = f"{table}_init_staging"
+    upsert_sql  = f"""
+        INSERT INTO "{table}" ({cols_q})
+        SELECT {cols_q} FROM "{staging}"
+        ON CONFLICT ({conflict_q}) DO UPDATE SET {update_q}
+    """
+
+    total_chunks   = (len(df) - 1) // CHUNK_SIZE + 1
+    total_upserted = 0
+
+    for i, start in enumerate(range(0, len(df), CHUNK_SIZE), 1):
+        chunk = df.iloc[start : start + CHUNK_SIZE]
+        pct   = round(100 * i / total_chunks)
+        log.info(f"   ↳ Chunk {i}/{total_chunks} ({pct}%) — {len(chunk):,} rows")
+
+        def _do_chunk(chunk=chunk):
+            with engine.begin() as conn:
+                conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+                chunk.to_sql(staging, conn, if_exists="replace",
+                             index=False, method="multi", chunksize=1000)
+                conn.execute(text(upsert_sql))
+                conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+
+        _retry(_do_chunk)
+        total_upserted += len(chunk)
+
+    log.info(f"   ✅ {table} → {total_upserted:,} rows upserted in {total_chunks} chunks")
+    return total_upserted
+
+
+# ── FACT TABLE CREATION ─────────────────────────────────────────────────────
+
+def _ensure_fact_tables(engine) -> None:
+    create_sql = """
+    CREATE TABLE IF NOT EXISTS fact_sales_lines (
+        date_key INTEGER NOT NULL, inv_no TEXT NOT NULL, icode TEXT NOT NULL,
+        order_no TEXT, da_no TEXT, cust_code TEXT, morder TEXT,
+        inv_dated TEXT, supplier_code TEXT, cust_branch_key TEXT,
+        inv_quantity NUMERIC(18,4), inv_rate NUMERIC(18,4), inv_amount NUMERIC(18,4),
+        tax_amount NUMERIC(18,4), line_total NUMERIC(18,4), bill_total NUMERIC(18,4),
+        inv_wt_tons NUMERIC(18,4), tot_pkgs NUMERIC(18,4),
+        month_key INTEGER GENERATED ALWAYS AS (date_key / 100) STORED,
+        assignment_key TEXT NOT NULL DEFAULT '',
+        CONSTRAINT fact_sales_lines_pk PRIMARY KEY (date_key, inv_no, icode, order_no, da_no, cust_code, morder)
+    );
+
+    CREATE TABLE IF NOT EXISTS fact_collection (
+        date_key INTEGER NOT NULL, calendar_date TEXT, month_name TEXT,
+        acode TEXT, supplier_code TEXT, branchcd TEXT, cust_branch_key TEXT,
+        customer_code TEXT, name TEXT, collection_amount NUMERIC(18,4),
+        month_key INTEGER GENERATED ALWAYS AS (date_key / 100) STORED,
+        assignment_key TEXT NOT NULL DEFAULT '',
+        CONSTRAINT fact_collection_pk PRIMARY KEY (date_key, acode, supplier_code)
+    );
+
+    CREATE TABLE IF NOT EXISTS fact_collected_ageing (
+        client_code      TEXT          NOT NULL,
+        supplier_code    TEXT          NOT NULL,
+        inv_no           TEXT          NOT NULL DEFAULT '',
+        collection_term  TEXT          NOT NULL,
+        collection_value NUMERIC(18,4) NOT NULL,
+        cust_branch_key  TEXT,
+        client_name      TEXT,
+        branchcd         TEXT,
+        inv_date         TEXT,
+        inv_amount       NUMERIC(18,4),
+        total_collected  NUMERIC(18,4),
+        due_date         TEXT,
+        payment_date     TEXT,
+        payment_date_key INTEGER,
+        month_key        INTEGER,
+        assignment_key   TEXT NOT NULL DEFAULT '',
+        CONSTRAINT fact_collected_ageing_pk PRIMARY KEY (client_code, supplier_code, inv_no, collection_term)
+    );
+    """
+    with engine.begin() as conn:
+        for stmt in create_sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    log.warning(f"⚠️ Fact table creation warning: {e}")
+    migrations = [
+        "ALTER TABLE fact_collected_ageing DROP COLUMN IF EXISTS company",
+        "ALTER TABLE fact_collected_ageing DROP COLUMN IF EXISTS sales_person",
+        "ALTER TABLE fact_collected_ageing DROP COLUMN IF EXISTS area",
+        "ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS due_date TEXT",
+        "ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS payment_date TEXT",
+        "ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS payment_date_key INTEGER",
+        "ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS month_key INTEGER",
+        "ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS assignment_key TEXT NOT NULL DEFAULT ''",
+    ]
+    with engine.begin() as conn:
+        for stmt in migrations:
+            try:
+                conn.execute(text(stmt))
+            except Exception as e:
+                log.warning(f"⚠️ Migration warning (ignored): {e}")
+    log.info("✅ Fact tables verified/created/migrated")
+
+
+# ── MAIN ─────────────────────────────────────────────────────────────────────
+
+def load_historical_data(years: Optional[list[int]] = None, dry_run: bool = DRY_RUN) -> None:
+    years = years or YEARS
+    log.info("\n" + "=" * 70)
+    log.info(f"🚀 INITIAL HISTORICAL LOAD  —  years: {years}{'  [DRY RUN]' if dry_run else ''}")
+    log.info("=" * 70)
+
+    engine       = create_engine(DB_CONN, pool_pre_ping=True)
+    supplier_map = _load_supplier_map()
+
+    _ensure_fact_tables(engine)
+    summary: list[dict] = []
+
+    # ── STEP 1: Load & normalise files ───────────────────────────────
+    log.info(f"\n{'─'*50}\n📂 STEP 1 — Loading & normalising fact files\n{'─'*50}")
+
+    sales_frames = []
+    for yr in years:
+        p = DATA_DIR / f"fact_sales_lines_{yr}.csv"
+        if p.exists():
+            sales_frames.append(_read_csv(p))
+        else:
+            log.warning(f"   ⚠️  {p.name} not found — skipping year {yr}")
+    sales_df = pd.concat(sales_frames, ignore_index=True) if sales_frames else None
+    if sales_df is not None:
+        log.info(f"   🔗 Sales combined → {len(sales_df):,} rows")
+        sales_df = _normalise_sales(sales_df, supplier_map)
+
+    coll_frames = []
+    for yr in years:
+        p = DATA_DIR / f"fact_collection_{yr}.csv"
+        if p.exists():
+            df_yr = _read_csv(p)
+            df_yr = _normalise_collection(df_yr, supplier_map, yr)
+            coll_frames.append(df_yr)
+        else:
+            log.warning(f"   ⚠️  fact_collection_{yr}.csv not found — skipping")
+    coll_df = pd.concat(coll_frames, ignore_index=True) if coll_frames else None
+    if coll_df is not None:
+        log.info(f"   🔗 Collection combined → {len(coll_df):,} rows")
+
+    coll_ageing_frames = []
+    for yr in years:
+        p = DATA_DIR / f"fact_collected_ageing_{yr}.csv"
+        if p.exists():
+            df_yr = _read_csv(p)
+            df_yr = _normalise_collected_ageing(df_yr, supplier_map)
+            coll_ageing_frames.append(df_yr)
+        else:
+            log.warning(f"   ⚠️  fact_collected_ageing_{yr}.csv not found — skipping")
+    coll_ageing_df = pd.concat(coll_ageing_frames, ignore_index=True) if coll_ageing_frames else None
+    if coll_ageing_df is not None:
+        log.info(f"   🔗 Collected Ageing combined → {len(coll_ageing_df):,} rows")
+
+    # ── STEP 2: Build dimensions (including from ageing) ─────────────
+    log.info(f"\n{'─'*50}\n🏗️  STEP 2 — Building dimensions from fact data\n{'─'*50}")
+
+    if sales_df is not None:
+        _build_and_insert_dim_date(engine, sales_df, dry_run)
+        _build_and_insert_dim_item(engine, sales_df, dry_run)
+
+    _build_and_insert_dim_warehouse(
+        engine,
+        *(df for df in (sales_df, coll_df, coll_ageing_df) if df is not None),
+        dry_run=dry_run,
+    )
+
+    _build_and_insert_dim_customer(
+        engine,
+        sales_df,
+        coll_df,
+        dry_run,
+        ageing_df=coll_ageing_df,
+    )
+
+    if coll_ageing_df is not None:
+        _ensure_dim_date_keys_from_ageing(engine, coll_ageing_df, dry_run)
+
+    # Ensure monthly assignments for all facts
+    if sales_df is not None:
+        _ensure_monthly_assignments_from_df(engine, sales_df, "fact_sales_lines", dry_run)
+    if coll_df is not None:
+        _ensure_monthly_assignments_from_df(engine, coll_df, "fact_collection", dry_run)
+    if coll_ageing_df is not None:
+        _ensure_collected_ageing_assignments(engine, coll_ageing_df, dry_run)
+
+    # ── STEP 3: Upsert fact tables ───────────────────────────────────
+    log.info(f"\n{'─'*50}\n📦 STEP 3 — Upserting fact tables\n{'─'*50}")
+
+    if sales_df is not None:
+        log.info("\n📦 fact_sales_lines")
+        before = _row_count(engine, "fact_sales_lines")
+        t0 = time.time()
+        sales_clean = sales_df[[c for c in FACT_COLS["fact_sales_lines"] if c in sales_df.columns]].copy()
+        pre = len(sales_clean)
+        sales_clean = sales_clean.drop_duplicates(subset=UPSERT_KEYS["fact_sales_lines"], keep="last")
+        if pre != len(sales_clean):
+            log.info(f"   🧹 Dedup: {pre:,} → {len(sales_clean):,}")
+        upserted = _upsert(engine, "fact_sales_lines", sales_clean, dry_run)
+        after = _row_count(engine, "fact_sales_lines")
+        elapsed = round(time.time() - t0, 1)
+        log.info(f"   before={before:,}  after={after:,}  +{after-before:,}  ({elapsed}s)")
+        summary.append({"table": "fact_sales_lines", "before": before, "after": after,
+                        "upserted": upserted, "elapsed_s": elapsed})
+
+    if coll_df is not None:
+        log.info("\n📦 fact_collection")
+        before = _row_count(engine, "fact_collection")
+        t0 = time.time()
+        coll_clean = coll_df[[c for c in FACT_COLS["fact_collection"] if c in coll_df.columns]].copy()
+        pre = len(coll_clean)
+        coll_clean = coll_clean.drop_duplicates(subset=UPSERT_KEYS["fact_collection"], keep="last")
+        if pre != len(coll_clean):
+            log.info(f"   🧹 Dedup: {pre:,} → {len(coll_clean):,}")
+        upserted = _upsert(engine, "fact_collection", coll_clean, dry_run)
+        after = _row_count(engine, "fact_collection")
+        elapsed = round(time.time() - t0, 1)
+        log.info(f"   before={before:,}  after={after:,}  +{after-before:,}  ({elapsed}s)")
+        summary.append({"table": "fact_collection", "before": before, "after": after,
+                        "upserted": upserted, "elapsed_s": elapsed})
+
+    if coll_ageing_df is not None:
+        log.info("\n📦 fact_collected_ageing")
+        before = _row_count(engine, "fact_collected_ageing")
+        t0 = time.time()
+        coll_ageing_clean = coll_ageing_df[[c for c in FACT_COLS["fact_collected_ageing"] if c in coll_ageing_df.columns]].copy()
+        pre = len(coll_ageing_clean)
+        coll_ageing_clean = coll_ageing_clean.drop_duplicates(
+            subset=UPSERT_KEYS["fact_collected_ageing"], keep="last"
+        )
+        if pre != len(coll_ageing_clean):
+            log.info(f"   🧹 Dedup: {pre:,} → {len(coll_ageing_clean):,}")
+        upserted = _upsert(engine, "fact_collected_ageing", coll_ageing_clean, dry_run)
+        after = _row_count(engine, "fact_collected_ageing")
+        elapsed = round(time.time() - t0, 1)
+        log.info(f"   before={before:,}  after={after:,}  +{after-before:,}  ({elapsed}s)")
+        summary.append({"table": "fact_collected_ageing", "before": before, "after": after,
+                        "upserted": upserted, "elapsed_s": elapsed})
+
+    # ── Summary ───────────────────────────────────────────────────────
+    log.info("\n" + "=" * 70)
+    log.info("📊 LOAD SUMMARY")
+    log.info(f"{'Table':<25} {'Before':>10} {'After':>10} {'Upserted':>10} {'Time(s)':>8}")
+    log.info("─" * 70)
+    for r in summary:
+        log.info(f"{r['table']:<25} {r['before']:>10,} {r['after']:>10,} {r['upserted']:>10,} {r['elapsed_s']:>8}")
+    if dry_run:
+        log.info("\n⚠️  DRY RUN — no data was written to the database")
+    log.info("\n✅ INITIAL LOAD COMPLETE")
+    log.info("=" * 70)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Initial historical load for ERP data warehouse")
+    parser.add_argument("--years",   nargs="+", type=int, default=YEARS,
+                        help="e.g. --years 2024 2025")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Validate and log without writing to DB")
+    args = parser.parse_args()
+    load_historical_data(years=args.years, dry_run=args.dry_run)
+

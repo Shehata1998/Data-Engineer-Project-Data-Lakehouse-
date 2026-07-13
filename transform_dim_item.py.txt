@@ -1,0 +1,158 @@
+"""
+Build dim_item
+──────────────
+PRIMARY KEY : item_code
+
+FOREIGN KEY reference:
+  - fact_sales_lines.icode
+
+Strategy:
+  1. Start with ALL unique icode from fact_sales_lines (primary source)
+  2. Enrich with item_name, sub_group, brand from Item_Master_Report (if available)
+  3. Any icode not in Item_Master gets default 'Unknown' values
+
+This ensures NO orphan icode in fact_sales_lines.
+"""
+
+import pandas as pd
+import logging
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+FACT_SALES_PATH  = "/opt/airflow/data/fact_sales_lines.csv"
+ITEM_MASTER_PATH = "/opt/airflow/data/Item_Master_Report.csv"
+DIM_ITEM_PATH    = "/opt/airflow/data/dim_item.csv"
+
+
+def _find_col(columns: list, candidates: set) -> str | None:
+    upper = {c.strip().upper() for c in candidates}
+    return next((c for c in columns if c.strip().upper() in upper), None)
+
+
+def _read_csv_safe(path: str) -> pd.DataFrame:
+    for enc in ('utf-8-sig', 'utf-8', 'latin-1'):
+        try:
+            df = pd.read_csv(path, dtype=str, encoding=enc, on_bad_lines="warn")
+            df.columns = [c.strip().lower() for c in df.columns]
+            return df
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot read {path}")
+
+
+def build_dim_item() -> tuple:
+
+    log.info("🔄 Building dim_item (ensuring ALL icode from fact_sales_lines exist)...")
+
+    # ── Source 1: fact_sales_lines (ALL icode) ────────────────────────
+    if not Path(FACT_SALES_PATH).exists():
+        raise FileNotFoundError(f"❌ fact_sales_lines not found: {FACT_SALES_PATH}")
+
+    sales_df = _read_csv_safe(FACT_SALES_PATH)
+    if 'icode' not in sales_df.columns:
+        raise ValueError("❌ 'icode' column missing in fact_sales_lines")
+
+    # Get all unique icode from fact_sales_lines
+    all_icodes = sales_df['icode'].dropna().astype(str).str.strip().unique()
+    dim = pd.DataFrame({'item_code': all_icodes})
+    log.info(f"📊 Source 1 (fact_sales_lines): {len(dim):,} unique icodes")
+
+    # ── Source 2: Item Master (enrichment) ────────────────────────────
+    if not Path(ITEM_MASTER_PATH).exists():
+        log.warning(f"⚠️ Item Master not found: {ITEM_MASTER_PATH}")
+        log.warning("   Using default values for item_name, sub_group, brand")
+        dim['item_name'] = dim['item_code']  # use code as name
+        dim['sub_group'] = ''
+        dim['brand'] = ''
+    else:
+        master_df = _read_csv_safe(ITEM_MASTER_PATH)
+        all_cols = master_df.columns.tolist()
+        log.info(f"📋 Item Master columns: {all_cols}")
+
+        code_col   = _find_col(all_cols, {"ITEMNO","ITEM_NO","ICODE","ITEM_CODE","ITEMCODE"})
+        name_col   = _find_col(all_cols, {"ITEMNAMEA","ITEM_NAME","ITEM NAME","ITEMNAME"})
+        subgrp_col = _find_col(all_cols, {"SUB BRAND","SUB_BRAND","SUBBRAND","SUB_GRP_NAME","SUB GRP NAME"})
+        brand_col  = _find_col(all_cols, {"MASTERBRAND","MASTER_BRAND","BRAND"})
+
+        if not code_col or not name_col:
+            log.warning("⚠️ Cannot detect item code/name in Item Master. Using defaults.")
+            dim['item_name'] = dim['item_code']
+            dim['sub_group'] = ''
+            dim['brand'] = ''
+        else:
+            # Prepare master mapping
+            master_df.rename(columns={
+                code_col:   'item_code',
+                name_col:   'item_name',
+                **({subgrp_col: 'sub_group'} if subgrp_col else {}),
+                **({brand_col:  'brand'}     if brand_col  else {}),
+            }, inplace=True)
+            for col in ['item_code','item_name','sub_group','brand']:
+                if col not in master_df.columns:
+                    master_df[col] = ''
+            master_df['item_code'] = master_df['item_code'].astype(str).str.strip()
+            # Keep only first occurrence per item_code
+            master_unique = master_df.drop_duplicates(subset=['item_code'], keep='first')
+            master_unique.set_index('item_code', inplace=True)
+
+            # Enrich dim with master data
+            dim['item_name'] = dim['item_code'].map(master_unique['item_name']).fillna(dim['item_code'])
+            dim['sub_group'] = dim['item_code'].map(master_unique['sub_group']).fillna('')
+            dim['brand']     = dim['item_code'].map(master_unique['brand']).fillna('')
+            log.info(f"📊 Source 2 (Item Master): {len(master_unique):,} unique icodes mapped")
+
+    # ── Clean final columns ───────────────────────────────────────────
+    dim['item_name'] = dim['item_name'].astype(str).str.strip()
+    dim['sub_group'] = dim['sub_group'].astype(str).str.strip()
+    dim['brand']     = dim['brand'].astype(str).str.strip()
+
+    # Ensure item_code is clean
+    dim['item_code'] = dim['item_code'].astype(str).str.strip()
+    dim = dim[dim['item_code'] != '']
+    dim = dim[dim['item_code'] != 'nan']
+
+    # Deduplicate (just in case)
+    before = len(dim)
+    dim = dim.drop_duplicates(subset=['item_code'], keep='first')
+    if before != len(dim):
+        log.info(f"🧹 Dedup: {before:,} → {len(dim):,} unique items")
+
+    # ── Final column order ───────────────────────────────────────────
+    dim = dim[['item_code', 'item_name', 'sub_group', 'brand']].sort_values('item_code').reset_index(drop=True)
+
+    # ── FK Coverage check (should be zero orphans now) ────────────────
+    log.info("\n🔍 Running FK coverage check...")
+    fact_icodes = set(sales_df['icode'].dropna().astype(str).str.strip().unique())
+    dim_icodes  = set(dim['item_code'].unique())
+    orphans = fact_icodes - dim_icodes
+    if orphans:
+        log.error(f"❌ {len(orphans)} orphan icodes still exist! This should not happen.")
+        log.error(f"   Sample: {list(orphans)[:10]}")
+    else:
+        log.info("✅ FK coverage OK — all fact_sales_lines.icode exist in dim_item")
+
+    # ── Save dim_item ─────────────────────────────────────────────────
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    dim.to_csv(DIM_ITEM_PATH, index=False, encoding='utf-8-sig')
+    log.info(f"✅ dim_item.csv saved → {DIM_ITEM_PATH} | {len(dim):,} rows")
+
+    # ── Clean fact_sales_lines — remove item-detail cols if present ───
+    log.info("🧹 Cleaning fact_sales_lines — removing item-detail columns...")
+    if Path(FACT_SALES_PATH).exists():
+        df = pd.read_csv(FACT_SALES_PATH, dtype=str)
+        df.columns = df.columns.str.strip().str.lower()
+        remove = ['sub_grp_name', 'item_name', 'brand']
+        existing_remove = [c for c in remove if c in df.columns]
+        if existing_remove:
+            df.drop(columns=existing_remove, inplace=True)
+            log.info(f"🗑️ Removed: {existing_remove}")
+            df.to_csv(FACT_SALES_PATH, index=False, encoding='utf-8-sig')
+            log.info(f"✅ fact_sales_lines updated | {len(df):,} rows")
+
+    return DIM_ITEM_PATH, FACT_SALES_PATH
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    build_dim_item()

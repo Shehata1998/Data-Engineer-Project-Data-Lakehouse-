@@ -1,0 +1,1007 @@
+"""
+load_to_postgres.py  —  Daily ETL load step (called by Airflow DAG)
+────────────────────────────────────────────────────────────────────
+Dimensions  → INSERT … ON CONFLICT DO UPDATE  (always fresh)
+Facts       → Chunked UPSERT (INSERT … ON CONFLICT DO UPDATE)
+
+Tables:
+  dim_date                           PK: date_key
+  dim_warehouse                      PK: supplier_code
+  dim_customer                       PK: customer_branch_code
+  dim_sales_and_collection_assignment PK: assignment_key
+  dim_item                           PK: item_code
+  fact_sales_lines                   PK: (date_key, inv_no, icode, order_no, da_no, cust_code, morder)
+  fact_collection                    PK: (date_key, acode, supplier_code)
+  fact_debtors_ageing                PK: (client_code, supplier_code, payment_term)
+  fact_collected_ageing              PK: (client_code, supplier_code, inv_no, collection_term)
+
+Note:
+  • month_key is a generated column in fact_sales_lines and fact_collection.
+  • assignment_key is a regular column filled in Python or transform.
+  • FK from facts to dim_sales_and_collection_assignment uses assignment_key.
+  • fact_collected_ageing now includes date_keys and assignment_key.
+"""
+
+import logging
+import os
+import time
+import csv
+from pathlib import Path
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
+
+log = logging.getLogger(__name__)
+
+DB_CONN     = os.getenv("WAREHOUSE_DB_CONN", "postgresql+psycopg2://salman:salman@postgres:5432/salman_db")
+DATA_DIR    = Path("/opt/airflow/data")
+CHUNK_SIZE  = int(os.getenv("CHUNK_SIZE",   "5000"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES",  "3"))
+
+FILES = {
+    "dim_date":                DATA_DIR / "dim_date.csv",
+    "dim_customer":            DATA_DIR / "dim_customer.csv",
+    "dim_sales_and_collection_assignment": DATA_DIR / "dim_customer_assignment_ready.csv",
+    "dim_item":                DATA_DIR / "dim_item.csv",
+    "dim_warehouse":           DATA_DIR / "warehouse_master.csv",
+    "fact_sales_lines":        DATA_DIR / "fact_sales_lines.csv",
+    "fact_collection":         DATA_DIR / "fact_collection.csv",
+    "fact_debtors_ageing":     DATA_DIR / "fact_debtors_ageing.csv",
+    "fact_collected_ageing":   DATA_DIR / "fact_collected_ageing.csv",
+}
+
+UPSERT_KEYS = {
+    "fact_sales_lines":    ["date_key", "inv_no", "icode", "order_no", "da_no", "cust_code", "morder"],
+    "fact_collection":     ["date_key", "acode", "supplier_code"],
+    "fact_debtors_ageing": ["client_code", "supplier_code", "payment_term"],
+    "fact_collected_ageing": ["client_code", "supplier_code", "inv_no", "collection_term"],
+}
+
+DIM_PK = {
+    "dim_date":      "date_key",
+    "dim_customer":  "customer_branch_code",
+    "dim_warehouse": "supplier_code",
+    "dim_item":      "item_code",
+}
+
+FK_CHECKS = {
+    "fact_sales_lines": [
+        ("date_key",        "dim_date",      "date_key",             0),
+        ("supplier_code",   "dim_warehouse", "supplier_code",        "UNKNOWN"),
+        ("cust_branch_key", "dim_customer",  "customer_branch_code", "UNKNOWN"),
+        ("icode",           "dim_item",      "item_code",            "UNKNOWN"),
+    ],
+    "fact_collection": [
+        ("date_key",        "dim_date",      "date_key",             0),
+        ("supplier_code",   "dim_warehouse", "supplier_code",        "UNKNOWN"),
+        ("cust_branch_key", "dim_customer",  "customer_branch_code", "UNKNOWN"),
+    ],
+    "fact_debtors_ageing": [
+        ("supplier_code",   "dim_warehouse", "supplier_code",        "UNKNOWN"),
+        ("cust_branch_key", "dim_customer",  "customer_branch_code", "UNKNOWN"),
+    ],
+    "fact_collected_ageing": [
+    ("supplier_code",      "dim_warehouse", "supplier_code",        "UNKNOWN"),
+    ("cust_branch_key",    "dim_customer",  "customer_branch_code", "UNKNOWN"),
+    ("payment_date_key",   "dim_date",      "date_key",             0),
+    ("assignment_key",     "dim_sales_and_collection_assignment", "assignment_key", "UNKNOWN"),
+],
+}
+
+FACT_ALLOWED_COLS = {
+    "fact_sales_lines": [
+        "date_key", "inv_no", "icode", "inv_dated", "cust_code",
+        "supplier_code", "cust_branch_key", "inv_quantity", "inv_rate",
+        "inv_amount", "tax_amount", "line_total", "bill_total",
+        "inv_wt_tons", "tot_pkgs", "order_no", "da_no", "morder",
+        "assignment_key",          # filled in Python, not in CSV
+    ],
+    "fact_collection": [
+        "date_key", "calendar_date", "month_name", "acode",
+        "supplier_code", "branchcd", "cust_branch_key",
+        "customer_code", "name", "collection_amount",
+        "assignment_key",          # filled in Python, not in CSV
+    ],
+    "fact_debtors_ageing": [
+        "client_code", "supplier_code", "payment_term", "payment_value",
+        "cust_branch_key", "company", "client_name", "sales_person", "area", "branchcd",
+        "payment_days", "credit_limit", "total_amount", "not_due", "total_due",
+    ],
+    "fact_collected_ageing": [
+        "client_code", "supplier_code", "inv_no", "collection_term", "collection_value",
+        "cust_branch_key", "client_name", "branchcd",
+        "inv_date", "inv_amount", "total_collected",
+        "due_date", "payment_date", "payment_date_key", "month_key", "assignment_key",
+    ],
+}
+
+FACT_NUMERIC_COLS = {
+    "fact_sales_lines": [
+        "date_key", "inv_quantity", "inv_rate", "inv_amount",
+        "tax_amount", "line_total", "bill_total", "inv_wt_tons", "tot_pkgs",
+    ],
+    "fact_collection": ["date_key", "collection_amount"],
+    "fact_debtors_ageing": [
+        "payment_value", "payment_days", "credit_limit", "total_amount", "not_due", "total_due",
+    ],
+    "fact_collected_ageing": [
+        "collection_value", "inv_amount", "total_collected",
+        "payment_date_key", "month_key",
+    ],
+}
+
+COL_RENAMES = {"dim_warehouse": {"commetns": "comments"}}
+KEEP_COLS   = {"dim_warehouse": ["supplier_code", "supplier_name", "sub_supplier", "comments"]}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMA DDL
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS dim_date (
+    date_key INTEGER PRIMARY KEY, date DATE,
+    monthnum INTEGER, month VARCHAR(10), monthlong VARCHAR(20), quarter VARCHAR(5),
+    year INTEGER, fiscalmonthnum INTEGER, fiscalmonth VARCHAR(10),
+    fiscalmonthlong VARCHAR(20), fiscalquarter VARCHAR(5), fiscalyear VARCHAR(10),
+    curmonthoffset INTEGER, curquarteroffset INTEGER, curyearoffset INTEGER,
+    futuredate VARCHAR(10), monthyearnum INTEGER, monthyear VARCHAR(10),
+    monthyearlong VARCHAR(15), weekdaynum INTEGER, weekday VARCHAR(10),
+    weekdayweekend VARCHAR(10), weeksequencenum INTEGER, curweekoffset INTEGER,
+    curfiscalyearoffset INTEGER, dayofyear INTEGER, flag_ytd VARCHAR(5),
+    flag_mtd VARCHAR(5), flag_qtd VARCHAR(5), weekdate VARCHAR(20),
+    currentdayoffset INTEGER, weekofyear INTEGER, weekof1stdateofmonth INTEGER,
+    weekofmonth INTEGER, totalworkdays INTEGER, actworkdays INTEGER,
+    datetime VARCHAR(30), is_friday INTEGER, is_holiday INTEGER,
+    holiday_name TEXT, is_working_day INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS dim_customer (
+    customer_branch_code TEXT PRIMARY KEY,
+    customer_code TEXT, customer_name TEXT, supplier_code TEXT, branchcd TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dc_code     ON dim_customer (customer_code);
+CREATE INDEX IF NOT EXISTS idx_dc_supplier ON dim_customer (supplier_code);
+CREATE INDEX IF NOT EXISTS idx_dc_branch   ON dim_customer (branchcd);
+
+CREATE TABLE IF NOT EXISTS dim_sales_and_collection_assignment (
+    assignment_key TEXT PRIMARY KEY,
+    customer_branch_code TEXT NOT NULL,
+    month_key INTEGER NOT NULL,
+    month_start_date DATE NOT NULL,
+    acc_manager TEXT,
+    collector TEXT,
+    UNIQUE (customer_branch_code, month_key)
+);
+CREATE INDEX IF NOT EXISTS idx_dsca_branch ON dim_sales_and_collection_assignment (customer_branch_code);
+CREATE INDEX IF NOT EXISTS idx_dsca_month  ON dim_sales_and_collection_assignment (month_key);
+
+CREATE TABLE IF NOT EXISTS dim_warehouse (
+    supplier_code TEXT PRIMARY KEY,
+    supplier_name TEXT NOT NULL, sub_supplier TEXT, comments TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dim_item (
+    item_code TEXT PRIMARY KEY,
+    item_name TEXT, sub_group TEXT, brand TEXT
+);
+
+CREATE TABLE IF NOT EXISTS fact_sales_lines (
+    date_key INTEGER NOT NULL, inv_no TEXT NOT NULL, icode TEXT NOT NULL,
+    order_no TEXT, da_no TEXT, cust_code TEXT, morder TEXT,
+    inv_dated TEXT, supplier_code TEXT, cust_branch_key TEXT,
+    inv_quantity NUMERIC(18,4), inv_rate NUMERIC(18,4), inv_amount NUMERIC(18,4),
+    tax_amount NUMERIC(18,4), line_total NUMERIC(18,4), bill_total NUMERIC(18,4),
+    inv_wt_tons NUMERIC(18,4), tot_pkgs NUMERIC(18,4),
+    month_key INTEGER GENERATED ALWAYS AS (date_key / 100) STORED,
+    assignment_key TEXT NOT NULL DEFAULT '',
+    CONSTRAINT fact_sales_lines_pk PRIMARY KEY (date_key, inv_no, icode, order_no, da_no, cust_code, morder)
+);
+CREATE INDEX IF NOT EXISTS idx_fsl_date     ON fact_sales_lines (date_key);
+CREATE INDEX IF NOT EXISTS idx_fsl_cbk      ON fact_sales_lines (cust_branch_key);
+CREATE INDEX IF NOT EXISTS idx_fsl_cust     ON fact_sales_lines (cust_code);
+CREATE INDEX IF NOT EXISTS idx_fsl_supplier ON fact_sales_lines (supplier_code);
+CREATE INDEX IF NOT EXISTS idx_fsl_item     ON fact_sales_lines (icode);
+CREATE INDEX IF NOT EXISTS idx_fsl_month    ON fact_sales_lines (month_key);
+CREATE INDEX IF NOT EXISTS idx_fsl_assign   ON fact_sales_lines (assignment_key);
+
+CREATE TABLE IF NOT EXISTS fact_collection (
+    date_key INTEGER NOT NULL, calendar_date TEXT, month_name TEXT,
+    acode TEXT, supplier_code TEXT, branchcd TEXT, cust_branch_key TEXT,
+    customer_code TEXT, name TEXT, collection_amount NUMERIC(18,4),
+    month_key INTEGER GENERATED ALWAYS AS (date_key / 100) STORED,
+    assignment_key TEXT NOT NULL DEFAULT '',
+    CONSTRAINT fact_collection_pk PRIMARY KEY (date_key, acode, supplier_code)
+);
+CREATE INDEX IF NOT EXISTS idx_fc_date     ON fact_collection (date_key);
+CREATE INDEX IF NOT EXISTS idx_fc_cbk      ON fact_collection (cust_branch_key);
+CREATE INDEX IF NOT EXISTS idx_fc_acode    ON fact_collection (acode);
+CREATE INDEX IF NOT EXISTS idx_fc_supplier ON fact_collection (supplier_code);
+CREATE INDEX IF NOT EXISTS idx_fc_month    ON fact_collection (month_key);
+CREATE INDEX IF NOT EXISTS idx_fc_assign   ON fact_collection (assignment_key);
+
+CREATE TABLE IF NOT EXISTS fact_debtors_ageing (
+    client_code      TEXT          NOT NULL,
+    supplier_code    TEXT          NOT NULL,
+    payment_term     TEXT          NOT NULL,
+    payment_value    NUMERIC(18,4) NOT NULL,
+    cust_branch_key  TEXT,
+    company          TEXT,
+    client_name      TEXT,
+    sales_person     TEXT,
+    area             TEXT,
+    branchcd         TEXT,
+    payment_days     INTEGER,
+    credit_limit     NUMERIC(18,4),
+    total_amount     NUMERIC(18,4),
+    not_due          NUMERIC(18,4),
+    total_due        NUMERIC(18,4),
+    CONSTRAINT fact_debtors_ageing_pk PRIMARY KEY (client_code, supplier_code, payment_term)
+);
+CREATE INDEX IF NOT EXISTS idx_fda_cbk      ON fact_debtors_ageing (cust_branch_key);
+CREATE INDEX IF NOT EXISTS idx_fda_client   ON fact_debtors_ageing (client_code);
+CREATE INDEX IF NOT EXISTS idx_fda_supplier ON fact_debtors_ageing (supplier_code);
+
+CREATE TABLE IF NOT EXISTS fact_collected_ageing (
+    client_code      TEXT          NOT NULL,
+    supplier_code    TEXT          NOT NULL,
+    inv_no           TEXT          NOT NULL DEFAULT '',
+    collection_term  TEXT          NOT NULL,
+    collection_value NUMERIC(18,4) NOT NULL,
+    cust_branch_key  TEXT,
+    client_name      TEXT,
+    branchcd         TEXT,
+    inv_date         TEXT,
+    inv_amount       NUMERIC(18,4),
+    total_collected  NUMERIC(18,4),
+    due_date         TEXT,
+    payment_date     TEXT,
+    payment_date_key INTEGER,
+    month_key        INTEGER,
+    assignment_key   TEXT NOT NULL DEFAULT '',
+    CONSTRAINT fact_collected_ageing_pk PRIMARY KEY (client_code, supplier_code, inv_no, collection_term)
+);
+CREATE INDEX IF NOT EXISTS idx_fca_cbk      ON fact_collected_ageing (cust_branch_key);
+CREATE INDEX IF NOT EXISTS idx_fca_client   ON fact_collected_ageing (client_code);
+CREATE INDEX IF NOT EXISTS idx_fca_supplier ON fact_collected_ageing (supplier_code);
+CREATE INDEX IF NOT EXISTS idx_fca_payment  ON fact_collected_ageing (payment_date_key);
+CREATE INDEX IF NOT EXISTS idx_fca_assign   ON fact_collected_ageing (assignment_key);
+
+CREATE TABLE IF NOT EXISTS etl_audit_log (
+    id SERIAL PRIMARY KEY, run_date TIMESTAMP DEFAULT NOW(),
+    table_name VARCHAR(100), rows_upserted INTEGER, rows_orphaned INTEGER,
+    status VARCHAR(20), elapsed_seconds NUMERIC(10,2), notes TEXT
+);
+"""
+
+MIGRATIONS = [
+    'ALTER TABLE dim_date RENAME COLUMN "Date" TO date',
+    'ALTER TABLE dim_customer     ALTER COLUMN customer_branch_code TYPE TEXT',
+    'ALTER TABLE dim_customer     ALTER COLUMN customer_code        TYPE TEXT',
+    'ALTER TABLE dim_customer     ALTER COLUMN supplier_code        TYPE TEXT',
+    'ALTER TABLE dim_customer     ALTER COLUMN branchcd             TYPE TEXT',
+    'ALTER TABLE dim_item         ALTER COLUMN item_code            TYPE TEXT',
+    'ALTER TABLE dim_warehouse    ALTER COLUMN supplier_code        TYPE TEXT',
+    'ALTER TABLE fact_sales_lines ALTER COLUMN inv_no               TYPE TEXT',
+    'ALTER TABLE fact_sales_lines ALTER COLUMN icode                TYPE TEXT',
+    'ALTER TABLE fact_sales_lines ALTER COLUMN cust_code            TYPE TEXT',
+    'ALTER TABLE fact_sales_lines ALTER COLUMN supplier_code        TYPE TEXT',
+    'ALTER TABLE fact_sales_lines ALTER COLUMN cust_branch_key      TYPE TEXT',
+    'ALTER TABLE fact_collection  ALTER COLUMN acode                TYPE TEXT',
+    'ALTER TABLE fact_collection  ALTER COLUMN supplier_code        TYPE TEXT',
+    'ALTER TABLE fact_collection  ALTER COLUMN branchcd             TYPE TEXT',
+    'ALTER TABLE fact_collection  ALTER COLUMN cust_branch_key      TYPE TEXT',
+    'ALTER TABLE fact_collection  ALTER COLUMN customer_code        TYPE TEXT',
+    'ALTER TABLE fact_sales_lines DROP COLUMN IF EXISTS month',
+    'ALTER TABLE fact_sales_lines DROP COLUMN IF EXISTS year',
+    'ALTER TABLE fact_sales_lines DROP COLUMN IF EXISTS quarter',
+    'ALTER TABLE fact_sales_lines DROP CONSTRAINT IF EXISTS fact_sales_lines_pk',
+    'ALTER TABLE fact_sales_lines ADD CONSTRAINT fact_sales_lines_pk PRIMARY KEY (date_key, inv_no, icode, order_no, da_no, cust_code, morder)',
+    'ALTER TABLE etl_audit_log ADD COLUMN IF NOT EXISTS elapsed_seconds NUMERIC(10,2)',
+    'ALTER TABLE fact_sales_lines DROP CONSTRAINT IF EXISTS fk_fsl_date',
+    'ALTER TABLE fact_sales_lines DROP CONSTRAINT IF EXISTS fk_fsl_warehouse',
+    'ALTER TABLE fact_sales_lines DROP CONSTRAINT IF EXISTS fk_fsl_customer',
+    'ALTER TABLE fact_sales_lines DROP CONSTRAINT IF EXISTS fk_fsl_item',
+    'ALTER TABLE fact_sales_lines DROP CONSTRAINT IF EXISTS fk_fsl_monthly_assign',
+    'ALTER TABLE fact_sales_lines DROP CONSTRAINT IF EXISTS fk_fsl_assignment',
+    'ALTER TABLE fact_collection  DROP CONSTRAINT IF EXISTS fk_fc_date',
+    'ALTER TABLE fact_collection  DROP CONSTRAINT IF EXISTS fk_fc_warehouse',
+    'ALTER TABLE fact_collection  DROP CONSTRAINT IF EXISTS fk_fc_customer',
+    'ALTER TABLE fact_collection  DROP CONSTRAINT IF EXISTS fk_fc_monthly_assign',
+    'ALTER TABLE fact_collection  DROP CONSTRAINT IF EXISTS fk_fc_assignment',
+    'ALTER TABLE fact_debtors_ageing DROP CONSTRAINT IF EXISTS fk_fda_warehouse',
+    'ALTER TABLE fact_debtors_ageing DROP CONSTRAINT IF EXISTS fk_fda_customer',
+    'ALTER TABLE fact_collected_ageing DROP CONSTRAINT IF EXISTS fk_fca_warehouse',
+    'ALTER TABLE fact_collected_ageing DROP CONSTRAINT IF EXISTS fk_fca_customer',
+    'ALTER TABLE fact_collected_ageing DROP CONSTRAINT IF EXISTS fk_fca_date',
+    'ALTER TABLE fact_collected_ageing DROP CONSTRAINT IF EXISTS fk_fca_assignment',
+    # Remove old columns no longer in schema
+    'ALTER TABLE fact_collected_ageing DROP COLUMN IF EXISTS company',
+    'ALTER TABLE fact_collected_ageing DROP COLUMN IF EXISTS sales_person',
+    'ALTER TABLE fact_collected_ageing DROP COLUMN IF EXISTS area',
+    # Add new columns if they don't exist yet
+    'ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS due_date TEXT',
+    'ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS payment_date TEXT',
+    'ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS payment_date_key INTEGER',
+    'ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS month_key INTEGER',
+    'ALTER TABLE fact_collected_ageing ADD COLUMN IF NOT EXISTS assignment_key TEXT NOT NULL DEFAULT \'\'',
+
+    # Convert any previous assignment_key from generated to regular
+    """DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='fact_sales_lines' AND column_name='assignment_key') THEN
+            ALTER TABLE fact_sales_lines ALTER COLUMN assignment_key DROP EXPRESSION;
+            ALTER TABLE fact_sales_lines ALTER COLUMN assignment_key SET NOT NULL;
+            ALTER TABLE fact_sales_lines ALTER COLUMN assignment_key SET DEFAULT '';
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='fact_collection' AND column_name='assignment_key') THEN
+            ALTER TABLE fact_collection ALTER COLUMN assignment_key DROP EXPRESSION;
+            ALTER TABLE fact_collection ALTER COLUMN assignment_key SET NOT NULL;
+            ALTER TABLE fact_collection ALTER COLUMN assignment_key SET DEFAULT '';
+        END IF;
+    END$$;
+    """,
+
+    # Migrate old dim_customer_assignment table if it exists
+    """DO $$
+    BEGIN
+        IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'dim_customer_assignment') THEN
+            ALTER TABLE dim_customer_assignment RENAME TO dim_sales_and_collection_assignment;
+            ALTER TABLE dim_sales_and_collection_assignment ADD COLUMN IF NOT EXISTS month_key INTEGER;
+            ALTER TABLE dim_sales_and_collection_assignment ADD COLUMN IF NOT EXISTS collector TEXT;
+            ALTER TABLE dim_sales_and_collection_assignment ADD COLUMN IF NOT EXISTS assignment_key TEXT;
+            UPDATE dim_sales_and_collection_assignment
+            SET month_key = EXTRACT(YEAR FROM month_start_date)::INT * 100 + EXTRACT(MONTH FROM month_start_date)::INT
+            WHERE month_key IS NULL;
+            UPDATE dim_sales_and_collection_assignment
+            SET assignment_key = customer_branch_code || '_' || month_key::text
+            WHERE assignment_key IS NULL;
+            ALTER TABLE dim_sales_and_collection_assignment DROP CONSTRAINT IF EXISTS dim_customer_assignment_pkey;
+            ALTER TABLE dim_sales_and_collection_assignment DROP CONSTRAINT IF EXISTS dim_sales_and_collection_assignment_pkey;
+            ALTER TABLE dim_sales_and_collection_assignment ADD PRIMARY KEY (assignment_key);
+            ALTER TABLE dim_sales_and_collection_assignment ADD UNIQUE (customer_branch_code, month_key);
+        END IF;
+    END$$;
+    """
+]
+
+# FK constraints — added AFTER dims are loaded
+FK_STATEMENTS = [
+    "ALTER TABLE fact_sales_lines    ADD CONSTRAINT fk_fsl_date      FOREIGN KEY (date_key)        REFERENCES dim_date(date_key)             DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_sales_lines    ADD CONSTRAINT fk_fsl_warehouse  FOREIGN KEY (supplier_code)   REFERENCES dim_warehouse(supplier_code)    DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_sales_lines    ADD CONSTRAINT fk_fsl_customer   FOREIGN KEY (cust_branch_key) REFERENCES dim_customer(customer_branch_code) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_sales_lines    ADD CONSTRAINT fk_fsl_item       FOREIGN KEY (icode)           REFERENCES dim_item(item_code)             DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collection     ADD CONSTRAINT fk_fc_date        FOREIGN KEY (date_key)        REFERENCES dim_date(date_key)             DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collection     ADD CONSTRAINT fk_fc_warehouse   FOREIGN KEY (supplier_code)   REFERENCES dim_warehouse(supplier_code)    DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collection     ADD CONSTRAINT fk_fc_customer    FOREIGN KEY (cust_branch_key) REFERENCES dim_customer(customer_branch_code) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_debtors_ageing ADD CONSTRAINT fk_fda_warehouse  FOREIGN KEY (supplier_code)   REFERENCES dim_warehouse(supplier_code)    DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_debtors_ageing ADD CONSTRAINT fk_fda_customer   FOREIGN KEY (cust_branch_key) REFERENCES dim_customer(customer_branch_code) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collected_ageing ADD CONSTRAINT fk_fca_warehouse FOREIGN KEY (supplier_code)   REFERENCES dim_warehouse(supplier_code)    DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collected_ageing ADD CONSTRAINT fk_fca_customer  FOREIGN KEY (cust_branch_key) REFERENCES dim_customer(customer_branch_code) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collected_ageing ADD CONSTRAINT fk_fca_date      FOREIGN KEY (payment_date_key) REFERENCES dim_date(date_key)             DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collected_ageing ADD CONSTRAINT fk_fca_assignment FOREIGN KEY (assignment_key) REFERENCES dim_sales_and_collection_assignment(assignment_key) DEFERRABLE INITIALLY DEFERRED",
+
+    # Single column FK to monthly assignment table
+    "ALTER TABLE fact_sales_lines    ADD CONSTRAINT fk_fsl_assignment FOREIGN KEY (assignment_key) REFERENCES dim_sales_and_collection_assignment(assignment_key) DEFERRABLE INITIALLY DEFERRED",
+    "ALTER TABLE fact_collection     ADD CONSTRAINT fk_fc_assignment  FOREIGN KEY (assignment_key) REFERENCES dim_sales_and_collection_assignment(assignment_key) DEFERRABLE INITIALLY DEFERRED",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _retry(fn, *args, retries: int = MAX_RETRIES, **kwargs):
+    for attempt in range(1, retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except OperationalError as exc:
+            if attempt == retries:
+                raise
+            wait = attempt * 2
+            log.warning(f"   ⚡ DB error (attempt {attempt}/{retries}) — retry in {wait}s: {exc}")
+            time.sleep(wait)
+
+
+def _get_engine():
+    engine = create_engine(DB_CONN, pool_pre_ping=True)
+    log.info(f"🔌 Connected: {DB_CONN.split('@')[-1]}")
+    return engine
+
+
+def _row_count(engine, table: str) -> int:
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text(f'SELECT COUNT(*) FROM "{table}"')).scalar()
+    except Exception:
+        return 0
+
+
+def _read_csv(path: Path) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(path, "r", encoding=enc) as f:
+                reader   = csv.reader(f)
+                header   = next(reader)
+                expected = len(header)
+                rows = []
+                for row in reader:
+                    if len(row) == expected:
+                        rows.append(row)
+                    elif len(row) > expected:
+                        rows.append(row[:expected-1] + [" ".join(row[expected-1:])])
+                    else:
+                        rows.append(row + [""] * (expected - len(row)))
+            df = pd.DataFrame(rows, columns=header)
+            df.columns = [c.strip().lower() for c in df.columns]
+            df = df.rename(columns={"inv_number": "inv_no", "account": "customer_code"})
+            log.info(f"📂 {path.name} | {len(df):,} rows | enc={enc}")
+            return df
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot read {path}")
+
+
+def _get_dim_keys(engine, dim_table: str, pk_col: str) -> set:
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(f'SELECT "{pk_col}" FROM "{dim_table}"'))
+            return {str(r[0]).strip() for r in result if r[0] is not None}
+    except Exception as exc:
+        log.warning(f"⚠️  Could not fetch {dim_table}.{pk_col}: {exc}")
+        return set()
+
+
+def _seed_missing_dim_values(df: pd.DataFrame, table: str, engine) -> None:
+    SEED_CONFIG = {
+       
+    }
+
+    for fact_col, dim_table, dim_pk, _ in FK_CHECKS.get(table, []):
+        if fact_col not in df.columns or fact_col not in SEED_CONFIG:
+            continue
+
+        cfg_dim_table, cfg_pk, insert_sql = SEED_CONFIG[fact_col]
+
+        fact_vals = set(
+            df[fact_col].dropna().astype(str).str.strip().unique()
+        ) - {"", "nan", "None", "UNKNOWN", "0", "MISSING"}
+
+        if not fact_vals:
+            continue
+
+        existing = _get_dim_keys(engine, cfg_dim_table, cfg_pk)
+        missing  = fact_vals - existing
+
+        if not missing:
+            log.info(f"   ✅ {cfg_dim_table} — all {len(fact_vals):,} {fact_col} values exist")
+            continue
+
+        log.info(f"   🌱 Seeding {len(missing):,} missing {fact_col} values into {cfg_dim_table} ...")
+        with engine.begin() as conn:
+            for val in sorted(missing):
+                conn.execute(text(insert_sql), {"v": val})
+        log.info(f"   ✅ Seeded {len(missing):,} rows → {cfg_dim_table}")
+
+
+def _repair_fk(df: pd.DataFrame, table: str, engine) -> tuple[pd.DataFrame, int]:
+    total = 0
+    for fact_col, dim_table, dim_pk, fallback in FK_CHECKS.get(table, []):
+        if fact_col not in df.columns:
+            log.warning(f"⚠️  FK column '{fact_col}' not in {table} — skipping")
+            continue
+        dim_keys = _get_dim_keys(engine, dim_table, dim_pk)
+        if not dim_keys:
+            log.warning(f"⚠️  {dim_table} is empty — skipping FK check for {fact_col}")
+            continue
+        mask = ~df[fact_col].astype(str).str.strip().isin(dim_keys)
+        n    = mask.sum()
+        if n:
+            sample = df.loc[mask, fact_col].unique().tolist()[:10]
+            log.warning(f"⚠️  {table}.{fact_col}: {n:,} orphans → replaced with '{fallback}'. Sample: {sample}")
+            df.loc[mask, fact_col] = fallback
+            total += n
+        else:
+            log.info(f"✅ FK OK: {table}.{fact_col} → {dim_table}.{dim_pk} ({len(dim_keys):,} keys)")
+    return df, total
+
+
+def _log_audit(engine, table: str, rows: int, orphans: int,
+               status: str, elapsed: float = 0.0, notes: str = "") -> None:
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO etl_audit_log"
+                " (table_name, rows_upserted, rows_orphaned, status, elapsed_seconds, notes)"
+                " VALUES (:t, :r, :o, :s, :e, :n)"
+            ), {"t": table, "r": int(rows), "o": int(orphans),
+                "s": status, "e": round(elapsed, 2), "n": notes})
+    except Exception as exc:
+        log.warning(f"⚠️  Audit log failed: {exc}")
+
+
+def ensure_schema(engine) -> None:
+    for stmt in [s.strip() for s in SCHEMA_SQL.split(";") if s.strip()]:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as e:
+            log.warning(f"⚠️ DDL statement failed (ignored): {e}")
+
+    # Seed placeholder rows
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO dim_sales_and_collection_assignment
+                (assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector)
+            VALUES ('UNKNOWN', 'UNKNOWN', 0, '1900-01-01', 'Unknown', 'Unknown')
+            ON CONFLICT (assignment_key) DO NOTHING
+        """))
+
+    for migration in MIGRATIONS:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(migration))
+        except Exception:
+            pass
+
+    log.info("✅ Schema verified / migrated")
+
+
+def apply_fk_constraints(engine) -> None:
+    fk_added = 0
+    for fk in FK_STATEMENTS:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(fk))
+            fk_added += 1
+            name = fk.split("ADD CONSTRAINT")[1].split("FOREIGN")[0].strip()
+            log.info(f"   ✅ FK added: {name}")
+        except Exception:
+            pass
+    if fk_added:
+        log.info(f"   FK constraints applied: {fk_added}/{len(FK_STATEMENTS)}")
+    else:
+        log.info(f"   FK constraints already in place ({len(FK_STATEMENTS)} total)")
+
+
+def _ensure_table_exists(engine, table: str) -> None:
+    """Create the fact table if it doesn't exist, with month_key as generated column."""
+    create_map = {
+        "fact_sales_lines": """
+            CREATE TABLE IF NOT EXISTS fact_sales_lines (
+                date_key INTEGER NOT NULL, inv_no TEXT NOT NULL, icode TEXT NOT NULL,
+                order_no TEXT, da_no TEXT, cust_code TEXT, morder TEXT,
+                inv_dated TEXT, supplier_code TEXT, cust_branch_key TEXT,
+                inv_quantity NUMERIC(18,4), inv_rate NUMERIC(18,4), inv_amount NUMERIC(18,4),
+                tax_amount NUMERIC(18,4), line_total NUMERIC(18,4), bill_total NUMERIC(18,4),
+                inv_wt_tons NUMERIC(18,4), tot_pkgs NUMERIC(18,4),
+                month_key INTEGER GENERATED ALWAYS AS (date_key / 100) STORED,
+                assignment_key TEXT NOT NULL DEFAULT '',
+                CONSTRAINT fact_sales_lines_pk PRIMARY KEY (date_key, inv_no, icode, order_no, da_no, cust_code, morder)
+            )""",
+        "fact_collection": """
+            CREATE TABLE IF NOT EXISTS fact_collection (
+                date_key INTEGER NOT NULL, calendar_date TEXT, month_name TEXT,
+                acode TEXT, supplier_code TEXT, branchcd TEXT, cust_branch_key TEXT,
+                customer_code TEXT, name TEXT, collection_amount NUMERIC(18,4),
+                month_key INTEGER GENERATED ALWAYS AS (date_key / 100) STORED,
+                assignment_key TEXT NOT NULL DEFAULT '',
+                CONSTRAINT fact_collection_pk PRIMARY KEY (date_key, acode, supplier_code)
+            )""",
+        "fact_debtors_ageing": """
+            CREATE TABLE IF NOT EXISTS fact_debtors_ageing (
+                client_code      TEXT          NOT NULL,
+                supplier_code    TEXT          NOT NULL,
+                payment_term     TEXT          NOT NULL,
+                payment_value    NUMERIC(18,4) NOT NULL,
+                cust_branch_key  TEXT,
+                company          TEXT,
+                client_name      TEXT,
+                sales_person     TEXT,
+                area             TEXT,
+                branchcd         TEXT,
+                payment_days     INTEGER,
+                credit_limit     NUMERIC(18,4),
+                total_amount     NUMERIC(18,4),
+                not_due          NUMERIC(18,4),
+                total_due        NUMERIC(18,4),
+                CONSTRAINT fact_debtors_ageing_pk PRIMARY KEY (client_code, supplier_code, payment_term)
+            )""",
+        "fact_collected_ageing": """
+            CREATE TABLE IF NOT EXISTS fact_collected_ageing (
+                client_code      TEXT          NOT NULL,
+                supplier_code    TEXT          NOT NULL,
+                inv_no           TEXT          NOT NULL DEFAULT '',
+                collection_term  TEXT          NOT NULL,
+                collection_value NUMERIC(18,4) NOT NULL,
+                cust_branch_key  TEXT,
+                client_name      TEXT,
+                branchcd         TEXT,
+                inv_date         TEXT,
+                inv_amount       NUMERIC(18,4),
+                total_collected  NUMERIC(18,4),
+                due_date         TEXT,
+                payment_date     TEXT,
+                payment_date_key INTEGER,
+                month_key        INTEGER,
+                assignment_key   TEXT NOT NULL DEFAULT '',
+                CONSTRAINT fact_collected_ageing_pk PRIMARY KEY (client_code, supplier_code, inv_no, collection_term)
+            )"""
+    }
+    if table in create_map:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(create_map[table]))
+            log.info(f"   ℹ️  Ensured table {table} exists.")
+        except Exception as exc:
+            log.warning(f"⚠️  Could not create table {table}: {exc}")
+    else:
+        log.warning(f"ℹ️  No explicit create for {table}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIM LOADER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prep_dim(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    renames = {k.lower(): v.lower() for k, v in COL_RENAMES.get(table, {}).items()}
+    df = df.rename(columns=renames)
+    keep = KEEP_COLS.get(table)
+    if keep:
+        df = df[[c for c in keep if c in df.columns]]
+    return df
+
+
+def load_dimension(engine, table: str, path: Path) -> int:
+    if not path.exists():
+        log.warning(f"⚠️  {path.name} not found — skipping {table}")
+        return 0
+
+    t0  = time.time()
+    df  = _prep_dim(_read_csv(path), table)
+
+    if table == "dim_date":
+        int_cols = [
+            "date_key","monthnum","year","fiscalmonthnum","curmonthoffset",
+            "curquarteroffset","curyearoffset","monthyearnum","weekdaynum",
+            "weeksequencenum","curweekoffset","curfiscalyearoffset","dayofyear",
+            "currentdayoffset","weekofyear","weekof1stdateofmonth","weekofmonth",
+            "totalworkdays","actworkdays","is_friday","is_holiday","is_working_day",
+        ]
+        for col in int_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+
+    pk_col   = DIM_PK[table]
+    all_cols = df.columns.tolist()
+    cols_q   = ", ".join(f'"{c}"' for c in all_cols)
+    update_q = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in all_cols if c != pk_col)
+    staging  = f"{table}_staging"
+
+    def _do():
+        with engine.begin() as conn:
+            conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+            df.to_sql(staging, conn, if_exists="replace", index=False,
+                      method="multi", chunksize=1000)
+            result = conn.execute(text(f"""
+                INSERT INTO "{table}" ({cols_q})
+                SELECT {cols_q} FROM "{staging}"
+                ON CONFLICT ("{pk_col}") DO UPDATE SET {update_q}
+            """))
+            conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+            return result.rowcount
+
+    affected = _retry(_do)
+    elapsed  = round(time.time() - t0, 1)
+    total    = _row_count(engine, table)
+    log.info(f"✅ {table} → {affected} rows affected | {len(df):,} in CSV | {total:,} total | {elapsed}s")
+    _log_audit(engine, table, affected or 0, 0, "SUCCESS", elapsed)
+    return total
+
+
+def load_dim_customer_assignment(engine, path: Path) -> int:
+    if not path.exists():
+        log.warning(f"⚠️  {path.name} not found — skipping dim_sales_and_collection_assignment")
+        return 0
+
+    t0 = time.time()
+    df = _read_csv(path)
+
+    required = ['customer_branch_code', 'month_key', 'month_start_date', 'acc_manager', 'collector']
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing column {col} in {path.name}")
+
+    df['month_start_date'] = pd.to_datetime(df['month_start_date']).dt.date
+    df['month_key'] = pd.to_numeric(df['month_key'], errors='coerce').fillna(0).astype(int)
+    df['customer_branch_code'] = df['customer_branch_code'].astype(str).str.strip()
+    df['acc_manager'] = df['acc_manager'].astype(str).str.strip().fillna('')
+    df['collector'] = df['collector'].astype(str).str.strip().fillna('')
+
+    df['assignment_key'] = df['customer_branch_code'] + '_' + df['month_key'].astype(str)
+    df = df[df['customer_branch_code'] != '']
+    df = df.drop_duplicates(subset=['assignment_key'], keep='last')
+
+    if df.empty:
+        log.info("   No valid rows for dim_sales_and_collection_assignment")
+        return 0
+
+    staging = "dim_sales_and_collection_assignment_staging"
+    with engine.begin() as conn:
+        df.to_sql(staging, conn, if_exists='replace', index=False, method='multi', chunksize=1000)
+        conn.execute(text(f"""
+            INSERT INTO dim_sales_and_collection_assignment
+                (assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector)
+            SELECT assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector
+            FROM "{staging}"
+            ON CONFLICT (assignment_key) DO UPDATE SET
+                customer_branch_code = EXCLUDED.customer_branch_code,
+                month_key            = EXCLUDED.month_key,
+                month_start_date     = EXCLUDED.month_start_date,
+                acc_manager          = EXCLUDED.acc_manager,
+                collector            = EXCLUDED.collector
+        """))
+        conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+
+    elapsed = round(time.time() - t0, 1)
+    log.info(f"✅ dim_sales_and_collection_assignment → {len(df):,} rows upserted | {elapsed}s")
+    _log_audit(engine, "dim_sales_and_collection_assignment", len(df), 0, "SUCCESS", elapsed,
+               f"upserted {len(df)} rows")
+    return len(df)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENSURE MONTHLY ASSIGNMENTS BEFORE FACT LOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_monthly_assignments_for_facts(df: pd.DataFrame, table: str, engine) -> None:
+    # Handle fact_collected_ageing separately (has month_key directly)
+    if table == "fact_collected_ageing":
+        if "cust_branch_key" not in df.columns or "month_key" not in df.columns:
+            return
+        temp = df[["cust_branch_key", "month_key"]].copy()
+        temp = temp.dropna()
+        if temp.empty:
+            return
+        temp["cust_branch_key"] = temp["cust_branch_key"].astype(str).str.strip()
+        temp["assignment_key"] = temp["cust_branch_key"] + '_' + temp["month_key"].astype(int).astype(str)
+        pairs_df = temp[["cust_branch_key", "month_key", "assignment_key"]].drop_duplicates()
+    elif table in ("fact_sales_lines", "fact_collection"):
+        if "cust_branch_key" not in df.columns or "date_key" not in df.columns:
+            return
+        temp = df[["cust_branch_key", "date_key"]].copy()
+        temp = temp[temp["date_key"].notna() & (temp["date_key"] != 0)]
+        if temp.empty:
+            return
+        temp["month_key"] = (temp["date_key"].astype(int) / 100).astype(int)
+        temp["cust_branch_key"] = temp["cust_branch_key"].astype(str).str.strip()
+        temp["assignment_key"] = temp["cust_branch_key"] + '_' + temp["month_key"].astype(str)
+        pairs_df = temp[["cust_branch_key", "month_key", "assignment_key"]].drop_duplicates()
+    else:
+        return
+
+    with engine.connect() as conn:
+        existing = pd.read_sql(
+            "SELECT assignment_key FROM dim_sales_and_collection_assignment",
+            conn
+        )
+    existing_set = set(existing["assignment_key"].astype(str).str.strip())
+
+    missing = pairs_df[~pairs_df["assignment_key"].isin(existing_set)].copy()
+
+    if missing.empty:
+        return
+
+    log.info(f"   🧩 Adding {len(missing)} default monthly assignments for {table} ...")
+
+    missing["year"] = missing["month_key"] // 100
+    missing["month"] = missing["month_key"] % 100
+    missing["month_start_date"] = pd.to_datetime(
+        missing["year"].astype(str) + "-" + missing["month"].astype(str) + "-01"
+    ).dt.date
+
+    default_rows = pd.DataFrame({
+        "assignment_key": missing["assignment_key"],
+        "customer_branch_code": missing["cust_branch_key"],
+        "month_key": missing["month_key"],
+        "month_start_date": missing["month_start_date"],
+        "acc_manager": "Not Assigned",
+        "collector": "Not Assigned"
+    })
+
+    with engine.begin() as conn:
+        default_rows.to_sql(
+            "_tmp_missing_assign",
+            conn,
+            if_exists="replace",
+            index=False,
+            method="multi",
+            chunksize=1000
+        )
+        conn.execute(text("""
+            INSERT INTO dim_sales_and_collection_assignment
+                (assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector)
+            SELECT assignment_key, customer_branch_code, month_key, month_start_date, acc_manager, collector
+            FROM _tmp_missing_assign
+            ON CONFLICT (assignment_key) DO NOTHING
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_missing_assign"))
+    log.info("   ✅ Default monthly assignments added.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FACT LOADER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prep_fact(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    allowed  = FACT_ALLOWED_COLS[table]
+    existing = [c for c in allowed if c in df.columns]
+    missing  = set(allowed) - set(existing)
+    if missing:
+        log.warning(f"⚠️  Columns absent in {table} CSV (will be NULL): {sorted(missing)}")
+    df = df[existing].copy()
+
+    for col in FACT_NUMERIC_COLS.get(table, []):
+        if col not in df.columns:
+            continue
+        if col in ("payment_days", "payment_value"):
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+        else:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce",
+            ).fillna(0)
+
+    # Build assignment_key for fact_sales_lines / fact_collection if missing
+    if table in ("fact_sales_lines", "fact_collection"):
+        if "date_key" in df.columns and "cust_branch_key" in df.columns:
+            month_key_series = (df["date_key"].astype(int) / 100).astype(int)
+            df["assignment_key"] = df["cust_branch_key"].astype(str) + '_' + month_key_series.astype(str)
+
+    return df
+
+
+def load_fact(engine, table: str, path: Path) -> int:
+    if not path.exists():
+        log.warning(f"⚠️  {path.name} not found — skipping {table}")
+        return 0
+
+    _ensure_table_exists(engine, table)
+
+    t0      = time.time()
+    df      = _prep_fact(_read_csv(path), table)
+    pk_cols = UPSERT_KEYS[table]
+
+    _ensure_monthly_assignments_for_facts(df, table, engine)
+
+    log.info(f"\n🔍 FK integrity check — {table}")
+    _seed_missing_dim_values(df, table, engine)
+    df, orphans = _repair_fk(df, table, engine)
+    log.info(f"📊 After FK repair: {len(df):,} rows | {orphans:,} values replaced")
+
+    missing_pk = [k for k in pk_cols if k not in df.columns]
+    if missing_pk:
+        raise ValueError(f"❌ Missing PK columns in {table}: {missing_pk}")
+
+    before = len(df)
+    df     = df.dropna(subset=pk_cols)
+    if len(df) != before:
+        log.warning(f"   ⚠️  Dropped {before - len(df):,} rows with NULL PK")
+
+    # Remove month_key from insertion list for fact_sales_lines/collection (generated column)
+    all_cols    = [c for c in df.columns if c != "month_key"]
+    update_cols = [c for c in all_cols if c not in pk_cols]
+    cols_q      = ", ".join(f'"{c}"' for c in all_cols)
+    conflict_q  = ", ".join(f'"{c}"' for c in pk_cols)
+    update_q    = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+    staging     = f"{table}_staging"
+    upsert_sql  = f"""
+        INSERT INTO "{table}" ({cols_q})
+        SELECT {cols_q} FROM "{staging}"
+        ON CONFLICT ({conflict_q}) DO UPDATE SET {update_q}
+    """
+
+    total_chunks   = (len(df) - 1) // CHUNK_SIZE + 1
+    total_upserted = 0
+
+    for i, start in enumerate(range(0, len(df), CHUNK_SIZE), 1):
+        chunk = df.iloc[start : start + CHUNK_SIZE]
+        pct   = round(100 * i / total_chunks)
+        log.info(f"   ↳ Chunk {i}/{total_chunks} ({pct}%) — {len(chunk):,} rows")
+
+        def _do_chunk(chunk=chunk):
+            with engine.begin() as conn:
+                conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+                chunk.to_sql(staging, conn, if_exists="replace",
+                             index=False, method="multi", chunksize=1000)
+                conn.execute(text(upsert_sql))
+                conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+
+        _retry(_do_chunk)
+        total_upserted += len(chunk)
+
+    elapsed = round(time.time() - t0, 1)
+    log.info(f"✅ {table} → {total_upserted:,} rows upserted | {orphans:,} orphans repaired | {elapsed}s")
+    _log_audit(engine, table, total_upserted, orphans, "SUCCESS", elapsed,
+               f"upserted {total_upserted} rows in {total_chunks} chunks")
+    return total_upserted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AIRFLOW ENTRY POINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_dimensions(**kwargs) -> str:
+    log.info("\n" + "="*60 + "\n📦 LOADING DIMENSIONS\n" + "="*60)
+    engine  = _get_engine()
+    ensure_schema(engine)
+    summary = []
+    for table in ["dim_date", "dim_customer", "dim_item", "dim_warehouse"]:
+        total = load_dimension(engine, table, FILES[table])
+        summary.append((table, total))
+    total_assign = load_dim_customer_assignment(engine, FILES["dim_sales_and_collection_assignment"])
+    summary.append(("dim_sales_and_collection_assignment", total_assign))
+    log.info("\n📊 DIMENSION SUMMARY")
+    for name, count in summary:
+        log.info(f"   {name:<25} {count:>10,} rows in DB")
+    apply_fk_constraints(engine)
+    log.info("✅ All dimensions loaded + FK constraints applied\n")
+    return "dimensions_loaded"
+
+
+def load_fact_sales(**kwargs) -> str:
+    log.info("\n" + "="*60 + "\n📦 LOADING fact_sales_lines\n" + "="*60)
+    engine = _get_engine()
+    ensure_schema(engine)
+    n = load_fact(engine, "fact_sales_lines", FILES["fact_sales_lines"])
+    apply_fk_constraints(engine)
+    log.info(f"✅ fact_sales_lines → {n:,} rows\n")
+    return "fact_sales_loaded"
+
+
+def load_fact_collection(**kwargs) -> str:
+    log.info("\n" + "="*60 + "\n📦 LOADING fact_collection\n" + "="*60)
+    engine = _get_engine()
+    ensure_schema(engine)
+    n = load_fact(engine, "fact_collection", FILES["fact_collection"])
+    apply_fk_constraints(engine)
+    log.info(f"✅ fact_collection → {n:,} rows\n")
+    return "fact_collection_loaded"
+
+
+def load_fact_debtors(**kwargs) -> str:
+    log.info("\n" + "="*60 + "\n📦 LOADING fact_debtors_ageing\n" + "="*60)
+    engine = _get_engine()
+    ensure_schema(engine)
+    n = load_fact(engine, "fact_debtors_ageing", FILES["fact_debtors_ageing"])
+    apply_fk_constraints(engine)
+    log.info(f"✅ fact_debtors_ageing → {n:,} rows\n")
+    return "fact_debtors_loaded"
+
+
+def load_fact_collected_ageing(**kwargs) -> str:
+    log.info("\n" + "="*60 + "\n📦 LOADING fact_collected_ageing\n" + "="*60)
+    engine = _get_engine()
+    ensure_schema(engine)
+    p = FILES["fact_collected_ageing"]
+    if not p.exists():
+        log.warning(f"⚠️  {p.name} not found — skipping load_fact_collected_ageing")
+        return "fact_collected_ageing_skipped"
+    n = load_fact(engine, "fact_collected_ageing", p)
+    apply_fk_constraints(engine)
+    log.info(f"✅ fact_collected_ageing → {n:,} rows\n")
+    return "fact_collected_ageing_loaded"
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    load_dimensions()
+    load_fact_sales()
+    load_fact_collection()
+    load_fact_debtors()
+    load_fact_collected_ageing()

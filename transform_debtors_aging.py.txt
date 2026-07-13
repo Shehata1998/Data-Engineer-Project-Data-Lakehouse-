@@ -1,0 +1,270 @@
+"""
+Transform Debtors Ageing Summary YTD → fact_debtors_ageing (unpivoted)
+────────────────────────────────────────────────────────────────────────
+Output columns (after unpivot):
+    supplier_code, client_code, cust_branch_key, company,
+    client_name, sales_person, area, branchcd, payment_days, credit_limit,
+    total_amount, not_due, total_due, payment_term, payment_value
+
+PK after load: (client_code, supplier_code, payment_term)
+"""
+
+import logging
+from pathlib import Path
+
+import pandas as pd
+
+log = logging.getLogger(__name__)
+
+INPUT_CSV        = "/opt/airflow/data/Debtors_Ageing_Summary_Report_YTD.csv"
+OUTPUT_CSV       = "/opt/airflow/data/fact_debtors_ageing.csv"
+WAREHOUSE_MASTER = "/opt/airflow/data/warehouse_master.csv"
+
+# الأعمدة التي سيتم الاحتفاظ بها قبل الـ unpivot (بدون date_key)
+BASE_COLS = [
+    "supplier_code", "client_code", "cust_branch_key", "company",
+    "client_name", "sales_person", "area", "branchcd", "payment_days",
+    "credit_limit", "total_amount", "not_due", "total_due",
+]
+
+# أعمدة due_* التي سيتم تحويلها إلى صفوف
+DUE_COLS = [
+    "due_0_to_30", "due_31_to_60", "due_61_to_90",
+    "due_91_to_120", "due_121_to_150", "due_over_150"
+]
+
+# جميع الأعمدة المطلوبة من المصدر قبل الـ unpivot
+ALL_SOURCE_COLS = BASE_COLS + DUE_COLS
+
+NUMERIC_COLS = [
+    "credit_limit", "total_amount", "not_due", "total_due",
+    "due_0_to_30", "due_31_to_60", "due_61_to_90",
+    "due_91_to_120", "due_121_to_150", "due_over_150",
+    "payment_days",
+]
+
+# أسماء الأعمدة في المصدر (مرادفات)
+COL_ALIASES = {
+    "client_code":    ["client_code", "clientcode", "cust_code", "account", "acc_no"],
+    "client_name":    ["client_name", "clientname", "customer_name", "name"],
+    "company":        ["company", "comp", "warehouse", "unit_ref"],
+    "sales_person":   ["sales_person", "salesperson", "sales_rep", "rep"],
+    "area":           ["area", "region", "zone"],
+    "branchcd":       ["branchcd", "branch", "br_code"],
+    "credit_limit":   ["credit_limit", "cr_limit", "crlimit"],
+    "payment_days":   ["payment_days", "p_days", "pay_days"],
+    "total_amount":   ["total_amount", "total", "balance", "os_amount"],
+    "not_due":        ["not_due", "notdue", "current"],
+    "total_due":      ["total_due", "totaldue", "overdue"],
+    "due_0_to_30":    ["due_0_to_30",  "0_30",   "0-30",   "1_30",   "1-30"],
+    "due_31_to_60":   ["due_31_to_60", "31_60",  "31-60"],
+    "due_61_to_90":   ["due_61_to_90", "61_90",  "61-90"],
+    "due_91_to_120":  ["due_91_to_120","91_120", "91-120"],
+    "due_121_to_150": ["due_121_to_150","121_150","121-150"],
+    "due_over_150":   ["due_over_150", "over_150","150+","over150"],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_csv_safe(path: str) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            df = pd.read_csv(path, dtype=str, encoding=enc, on_bad_lines="warn")
+            df.columns = df.columns.str.strip().str.strip('"').str.lower().str.replace(" ", "_")
+            df = df.iloc[:-1]  # drop last summary row added by ERP
+            return df
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot read {path}")
+
+
+def _resolve_col(df_cols: list, standard_name: str) -> str | None:
+    aliases = COL_ALIASES.get(standard_name, [standard_name])
+    for alias in aliases:
+        if alias.lower() in df_cols:
+            return alias.lower()
+    return None
+
+
+def _clean_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    ).fillna(0.0)
+
+
+def _load_company_to_supplier_map() -> dict:
+    if not Path(WAREHOUSE_MASTER).exists():
+        log.warning("⚠️  warehouse_master.csv not found — company→supplier_code mapping skipped")
+        return {}
+    
+    wm = pd.read_csv(WAREHOUSE_MASTER, encoding="latin1")
+    wm.columns = wm.columns.str.strip()
+    mapping = {}
+    
+    for br_col in ("Br_Code", "BranchCd", "Branch_Code", "Branch"):
+        if br_col in wm.columns and "Supplier_Code" in wm.columns:
+            for _, row in wm[[br_col, "Supplier_Code"]].dropna().iterrows():
+                key = str(row[br_col]).strip().upper()
+                val = str(row["Supplier_Code"]).strip()
+                if key and val:
+                    mapping[key] = val
+            log.info(f"   🗺️  Loaded {len(mapping)} mappings from {br_col} → Supplier_Code")
+            break
+    
+    if not mapping and "Sub_Supplier" in wm.columns and "Supplier_Code" in wm.columns:
+        for _, row in wm[["Sub_Supplier", "Supplier_Code"]].dropna().iterrows():
+            key = str(row["Sub_Supplier"]).strip().upper()
+            val = str(row["Supplier_Code"]).strip()
+            if key and val:
+                mapping[key] = val
+        log.info(f"   🗺️  Loaded {len(mapping)} mappings from Sub_Supplier → Supplier_Code")
+    
+    if not mapping and "Supplier_Code" in wm.columns:
+        for code in wm["Supplier_Code"].dropna():
+            key = str(code).strip().upper()
+            val = str(code).strip()
+            mapping[key] = val
+        log.info(f"   🗺️  Loaded {len(mapping)} direct Supplier_Code mappings")
+    
+    log.info(f"   ✅ Company→Supplier map ready: {len(mapping)} entries")
+    return mapping
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN TRANSFORM
+# ─────────────────────────────────────────────────────────────────────────────
+
+def transform_debtors_ageing() -> tuple[str, int]:
+    log.info("🚀 Transforming Debtors Ageing (no date_key, with unpivot) ...")
+
+    if not Path(INPUT_CSV).exists():
+        raise FileNotFoundError(f"❌ Not found: {INPUT_CSV}")
+
+    df = _read_csv_safe(INPUT_CSV)
+    log.info(f"✅ Loaded {len(df):,} rows | Columns: {df.columns.tolist()}")
+
+    df_cols = df.columns.tolist()
+
+    # ── Rename columns via alias resolution ──────────────────────────────────
+    rename_map = {}
+    for standard, _ in COL_ALIASES.items():
+        src = _resolve_col(df_cols, standard)
+        if src and src != standard and src in df.columns:
+            rename_map[src] = standard
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+        log.info(f"   🔁 Renamed: {rename_map}")
+
+    # ── Validate required columns ────────────────────────────────────────────
+    for required in ("company", "client_code"):
+        if required not in df.columns:
+            raise ValueError(f"❌ Required column '{required}' not found. Available: {df.columns.tolist()}")
+
+    # ── client_code ──────────────────────────────────────────────────────────
+    df["client_code"] = df["client_code"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+
+    # ── supplier_code: map from company name to numeric code ─────────────────
+    company_map = _load_company_to_supplier_map()
+    df["company_clean"] = df["company"].astype(str).str.strip().str.upper()
+    df["supplier_code"] = df["company_clean"].map(company_map)
+    
+    missing_map = df["supplier_code"].isna().sum()
+    if missing_map:
+        log.warning(f"   ⚠️  {missing_map:,} rows with unmapped company values. Using raw company as supplier_code.")
+        df["supplier_code"] = df["supplier_code"].fillna(df["company_clean"])
+    
+    df["supplier_code"] = df["supplier_code"].astype(str).str.replace(r"\.0$", "", regex=True)
+    log.info(f"   🔗 supplier_code sample: {df['supplier_code'].value_counts().head(5).to_dict()}")
+
+    # ── branchcd: same as supplier_code ──────────────────────────────────────
+    df["branchcd"] = df["supplier_code"].copy()
+
+    # ── cust_branch_key = client_code + supplier_code ────────────────────────
+    df["cust_branch_key"] = df["client_code"] + df["supplier_code"]
+    log.info(f"   🔑 cust_branch_key sample: {df['cust_branch_key'].head(5).tolist()}")
+
+    # ── Numeric columns ──────────────────────────────────────────────────────
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = _clean_numeric(df[col])
+        else:
+            df[col] = 0.0
+            log.warning(f"   ⚠️  Column '{col}' not found — defaulting to 0")
+
+    df["payment_days"] = df["payment_days"].fillna(0).astype(int)
+
+    # ── Fill missing optional text columns ───────────────────────────────────
+    for col in ("client_name", "sales_person", "area"):
+        if col not in df.columns:
+            df[col] = ""
+
+    # ── Ensure all source columns exist (before unpivot) ─────────────────────
+    for col in ALL_SOURCE_COLS:
+        if col not in df.columns:
+            df[col] = None
+
+    # ── Keep only needed columns before unpivot ──────────────────────────────
+    df = df[ALL_SOURCE_COLS].copy()
+
+    # ── Remove rows with missing PK values (client_code, supplier_code) ──────
+    before = len(df)
+    df = df.dropna(subset=["client_code", "supplier_code"])
+    df = df[df["client_code"].str.strip() != ""]
+    df = df[df["supplier_code"].str.strip() != ""]
+    removed = before - len(df)
+    if removed:
+        log.warning(f"   ⚠️  Removed {removed:,} rows with missing PK values")
+
+    # ── Dedup on (client_code, supplier_code) before unpivot ─────────────────
+    pre = len(df)
+    df = df.drop_duplicates(subset=["client_code", "supplier_code"], keep="last")
+    if pre != len(df):
+        log.info(f"   🧹 Dedup: {pre:,} → {len(df):,}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 🔄 UNPIVOT (محاكاة Power Query)
+    # ─────────────────────────────────────────────────────────────────────────
+    log.info("🔄 Applying Unpivot (due_* columns → payment_term, payment_value) ...")
+    
+    # التأكد من وجود أعمدة due_*
+    existing_due_cols = [c for c in DUE_COLS if c in df.columns]
+    if not existing_due_cols:
+        raise ValueError("❌ No due_* columns found for unpivot")
+    
+    # melt = unpivot
+    df_unpivoted = pd.melt(
+        df,
+        id_vars=BASE_COLS,
+        value_vars=existing_due_cols,
+        var_name="payment_term",
+        value_name="payment_value"
+    )
+    
+    # تصفية الأصفار (كما في Power Query: each [payment_value] <> 0)
+    # نستخدم مقارنة مع float لحساب الأصفار (بما في ذلك -0.0)
+    df_unpivoted = df_unpivoted[abs(df_unpivoted["payment_value"]) > 1e-9]
+    
+    # إعادة تعيين الفهرسة
+    df_unpivoted = df_unpivoted.reset_index(drop=True)
+    
+    log.info(f"   ✅ Unpivot complete: {len(df_unpivoted):,} rows (filtered non-zero)")
+
+    # ── Save final CSV ───────────────────────────────────────────────────────
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    df_unpivoted.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    log.info(f"✅ fact_debtors_ageing.csv saved | {len(df_unpivoted):,} rows (unpivoted, no date_key)")
+    return OUTPUT_CSV, len(df_unpivoted)
+
+
+def transform_debtors_ageing_airflow(**context) -> str:
+    path, _ = transform_debtors_ageing()
+    return path
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+    transform_debtors_ageing()

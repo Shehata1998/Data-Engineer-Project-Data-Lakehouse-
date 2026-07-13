@@ -1,0 +1,173 @@
+"""
+Transform Sales Invoices YTD → fact_sales_lines
+────────────────────────────────────────────────
+Output columns are lowercase to match PostgreSQL schema.
+
+FK columns:
+  date_key        → dim_date.date_key
+  supplier_code   → dim_warehouse.supplier_code
+  cust_branch_key → dim_customer.customer_branch_code
+  icode           → dim_item.item_code
+
+Modified to retain order_no, da_no, morder as part of the composite PK.
+"""
+
+import logging
+from pathlib import Path
+
+import pandas as pd
+
+log = logging.getLogger(__name__)
+
+SALES_CSV_PATH   = "/opt/airflow/data/Sales_Invoices_Report_YTD.csv"
+WAREHOUSE_MASTER = "/opt/airflow/data/warehouse_master.csv"
+FACT_SALES_PATH  = "/opt/airflow/data/fact_sales_lines.csv"
+
+INTERCOMPANY = {
+    "1009996", "2001388", "1003155", "2000810", "1004327",
+    "1008778", "2002498", "1000711", "2002682", "1007987",
+}
+
+# Columns to drop — operational / already in dimension tables
+# Removed order_no, da_no, morder from DROP_COLS so they are kept
+DROP_COLS = [
+    "inv_type", "sales_rep", "partcode", "vehicle_no", "foc_filter",
+    "consignee", "da_inv_tat", "dt_sort",
+    "vchnum", "comp", "model", "tpt_name", "transport", "inv_type_name",
+    "ent_by", "ent_dt", "freight", "cust_po_no",
+    # denormalised dim columns (live in dim tables)
+    "customer", "item_name", "sub_grp_name", "brand",
+    # date breakdown — available via dim_date join
+    "month", "year", "quarter",
+]
+
+# Final schema columns — matches fact_sales_lines DB table (including new PK columns)
+OUTPUT_COLS = [
+    "date_key", "inv_no", "icode", "inv_dated",
+    "cust_code", "supplier_code", "cust_branch_key",
+    "inv_quantity", "inv_rate", "inv_amount",
+    "tax_amount", "line_total", "bill_total",
+    "inv_wt_tons", "tot_pkgs",
+    "order_no", "da_no", "morder"      # added to composite PK
+]
+
+NUMERIC_COLS = [
+    "inv_quantity", "inv_rate", "inv_amount", "tax_amount",
+    "line_total", "bill_total", "inv_wt_tons", "tot_pkgs",
+]
+
+
+def transform_sales() -> str:
+    log.info("🔄 Starting Sales transformation...")
+
+    if not Path(SALES_CSV_PATH).exists():
+        raise FileNotFoundError(f"❌ Sales CSV not found: {SALES_CSV_PATH}")
+
+    # ── Load ──────────────────────────────────────────────────────────
+    df = pd.read_csv(SALES_CSV_PATH, dtype=str, on_bad_lines="warn")
+    df = df.iloc[:-1]  # drop last summary row added by ERP
+    df.columns = df.columns.str.strip().str.strip('"').str.upper()
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].astype(str).str.strip().str.strip('"')
+    log.info(f"📊 Loaded {len(df):,} rows | Columns: {df.columns.tolist()}")
+
+    # ── Map UNIT_REF → SUPPLIER_CODE ──────────────────────────────────
+    if "UNIT_REF" in df.columns and "SUPPLIER_CODE" not in df.columns:
+        if not Path(WAREHOUSE_MASTER).exists():
+            raise FileNotFoundError(f"❌ Warehouse master not found: {WAREHOUSE_MASTER}")
+        wm = pd.read_csv(WAREHOUSE_MASTER, encoding="latin1")
+        wm.columns = wm.columns.str.strip()
+        supplier_map = (
+            wm[["Sub_Supplier", "Supplier_Code"]]
+            .dropna(subset=["Sub_Supplier"])
+            .set_index("Sub_Supplier")["Supplier_Code"]
+            .to_dict()
+        )
+        df["UNIT_REF"]      = df["UNIT_REF"].astype(str).str.strip()
+        df["SUPPLIER_CODE"] = df["UNIT_REF"].map(supplier_map)
+        unmapped = df["SUPPLIER_CODE"].isna().sum()
+        if unmapped:
+            log.warning(f"⚠️  {unmapped:,} rows with unmapped UNIT_REF")
+        df.drop(columns=["UNIT_REF"], inplace=True)
+        log.info("🔗 UNIT_REF mapped to SUPPLIER_CODE")
+
+    # Handle ERP column name variant
+    if "INV_NUMBER" in df.columns and "INV_NO" not in df.columns:
+        df.rename(columns={"INV_NUMBER": "INV_NO"}, inplace=True)
+
+    # ── Clean FK columns ──────────────────────────────────────────────
+    df["SUPPLIER_CODE"] = (
+        df["SUPPLIER_CODE"].astype(str).str.strip()
+        .str.replace(".0", "", regex=False)
+    )
+    df["CUST_CODE"] = (
+        df.get("CUST_CODE", pd.Series([""] * len(df)))
+        .fillna("").astype(str)
+        .str.replace(".0", "", regex=False).str.strip()
+    )
+
+    # ── Filter intercompany ───────────────────────────────────────────
+    before = len(df)
+    df     = df[~df["CUST_CODE"].isin(INTERCOMPANY)].copy()
+    log.info(f"🧹 Removed {before - len(df):,} intercompany rows")
+
+    # ── Build CUST_BRANCH_KEY = CUST_CODE + SUPPLIER_CODE ────────────
+    df["CUST_BRANCH_KEY"] = df["CUST_CODE"] + df["SUPPLIER_CODE"]
+    log.info(f"🔑 CUST_BRANCH_KEY sample: {df['CUST_BRANCH_KEY'].iloc[0] if len(df) else 'N/A'}")
+
+    # ── Date parsing → DATE_KEY ───────────────────────────────────────
+    if "INV_DATED" in df.columns:
+        inv_dt        = pd.to_datetime(df["INV_DATED"], format="mixed", errors="coerce")
+        df["DATE_KEY"]  = inv_dt.dt.strftime("%Y%m%d").astype("Int64")
+        df["INV_DATED"] = inv_dt.dt.strftime("%m/%d/%Y")
+
+    df["DATE_KEY"] = pd.to_numeric(
+        df.get("DATE_KEY", pd.Series([0] * len(df))), errors="coerce"
+    ).fillna(0).astype(int)
+
+    # ── Numeric cleaning ──────────────────────────────────────────────
+    for col in NUMERIC_COLS:
+        uc = col.upper()
+        if uc not in df.columns:
+            continue
+        df[uc] = pd.to_numeric(
+            df[uc].astype(str)
+                  .str.replace(",", "", regex=False)
+                  .str.replace("-", "", regex=False)
+                  .str.strip(),
+            errors="coerce",
+        ).fillna(0)
+
+    # ── Drop operational columns (but keep order_no, da_no, morder) ───
+    drop = [c for c in DROP_COLS if c.upper() in df.columns]
+    df.drop(columns=[c.upper() for c in drop], inplace=True, errors="ignore")
+
+    # ── Lowercase all column names → matches PostgreSQL schema ────────
+    df.columns = [c.lower() for c in df.columns]
+
+    # ── Strip leading zeros from icode ────────────────────────────────
+    # ERP بيصدّر أحياناً icode بـ leading zero زي "07190002"
+    # بنشيل الـ leading zero عشان يتطابق مع dim_item
+    if "icode" in df.columns:
+        df["icode"] = df["icode"].astype(str).str.strip().str.lstrip("0")
+        # لو اتحول لـ "" (كان "0" أو "000") → رجّعه "0"
+        df["icode"] = df["icode"].replace("", "0")
+        log.info(f"   🔢 icode leading zeros stripped | sample: {df['icode'].iloc[:3].tolist()}")
+
+    # ── Keep only schema columns (add missing ones as NULL) ───────────
+    for col in OUTPUT_COLS:
+        if col not in df.columns:
+            df[col] = None
+    df = df[OUTPUT_COLS]
+
+    # ── Save ──────────────────────────────────────────────────────────
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    df.to_csv(FACT_SALES_PATH, index=False, encoding="utf-8-sig")
+
+    log.info(f"✅ fact_sales_lines.csv saved | {len(df):,} rows | {len(df.columns)} columns")
+    return FACT_SALES_PATH
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    transform_sales()

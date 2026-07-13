@@ -1,0 +1,2114 @@
+from selenium import webdriver
+
+from selenium.webdriver.chrome.service import Service
+
+from selenium.webdriver.chrome.options import Options
+
+from selenium.webdriver.common.by import By
+
+from selenium.webdriver.common.keys import Keys
+
+from selenium.webdriver.support.ui import WebDriverWait
+
+from selenium.webdriver.support import expected_conditions as EC
+
+from selenium.webdriver.common.action_chains import ActionChains
+
+from selenium.common.exceptions import TimeoutException
+
+import time
+
+import os
+
+from datetime import datetime
+
+from pathlib import Path
+
+from typing import Optional
+
+import logging
+ 
+ 
+class ERPAutomation:
+
+    """Automated ERP system interaction for Debtors Ageing Summary Report (YTD)."""
+ 
+    DOWNLOAD_DIR   = Path("/opt/airflow/data")
+
+    SCREENSHOT_DIR = Path("/opt/airflow/data/screenshots")
+ 
+    def __init__(self, username: str, password: str, headless: bool = True):
+
+        self.username   = username
+
+        self.password   = password
+
+        self.headless   = headless
+
+        self.login_url  = "https://sgerp.salmangroup.com/login.aspx"
+
+        self.driver: Optional[webdriver.Chrome] = None
+
+        self.wait:   Optional[WebDriverWait]    = None
+
+        self.start_time = time.time()
+
+        self._log_file  = Path("/opt/airflow/data/Debtors_Ageing_YTD_Automation.txt")
+
+        self._fix_permissions()
+
+        self._setup_logging()
+ 
+    def _fix_permissions(self):
+
+        try:
+
+            self.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+            self.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+            os.system(f"chmod -R 777 {self.DOWNLOAD_DIR}")
+
+            os.system(f"chmod -R 777 {self.SCREENSHOT_DIR}")
+
+        except Exception as e:
+
+            print(f"WARNING: Could not fix permissions: {e}")
+ 
+    def _setup_logging(self):
+
+        formatter = logging.Formatter(
+
+            '%(asctime)s [%(levelname)s] %(message)s',
+
+            datefmt='%Y-%m-%d %H:%M:%S'
+
+        )
+
+        console_handler = logging.StreamHandler()
+
+        console_handler.setFormatter(formatter)
+
+        self.logger = logging.getLogger(__name__)
+
+        self.logger.setLevel(logging.INFO)
+
+        if not self.logger.handlers:
+
+            self.logger.addHandler(console_handler)
+ 
+    def _elapsed_time(self) -> str:
+
+        return f"(⏱ {time.time() - self.start_time:.2f}s)"
+ 
+    def log(self, message: str, level: str = "info"):
+
+        getattr(self.logger, level)(f"{message} {self._elapsed_time()}")
+ 
+    def save_screenshot(self, name: str):
+
+        try:
+
+            filepath = self.SCREENSHOT_DIR / f"screenshot_{name}_{int(time.time())}.png"
+
+            self.driver.save_screenshot(str(filepath))
+
+            self.log(f"📸 Screenshot saved: {filepath}")
+
+        except Exception as e:
+
+            self.log(f"⚠️ Failed to save screenshot: {e}", "warning")
+ 
+    def initialize_driver(self):
+
+        try:
+
+            options = Options()
+
+            if self.headless:
+
+                options.add_argument("--headless=new")
+
+                options.add_argument("--window-size=1920,1080")
+
+            else:
+
+                options.add_argument("--start-maximized")
+
+            options.add_argument("--disable-gpu")
+
+            options.add_argument("--no-sandbox")
+
+            options.add_argument("--disable-dev-shm-usage")
+
+            options.add_argument("--disable-extensions")
+
+            options.add_argument("--disable-popup-blocking")
+
+            download_path = str(self.DOWNLOAD_DIR.resolve())
+
+            options.add_experimental_option("prefs", {
+
+                "download.default_directory": download_path,
+
+                "download.prompt_for_download": False,
+
+                "download.directory_upgrade": True,
+
+                "safebrowsing.enabled": True,
+
+                "plugins.always_open_pdf_externally": True,
+
+            })
+
+            service = Service("/usr/local/bin/chromedriver")
+
+            self.driver = webdriver.Chrome(service=service, options=options)
+
+            self.wait   = WebDriverWait(self.driver, 15)
+
+            self.log(f"✅ WebDriver initialized. Download path: {download_path}")
+
+        except Exception as e:
+
+            self.log(f"❌ Failed to initialize WebDriver: {e}", "error")
+
+            raise
+ 
+    def login(self) -> bool:
+
+        try:
+
+            self.driver.get(self.login_url)
+
+            self.wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "input")))
+
+            self.driver.find_element(By.XPATH, "//input[@placeholder='User Name']").send_keys(self.username)
+
+            pwd = self.driver.find_element(By.XPATH, "//input[@placeholder='Password']")
+
+            pwd.send_keys(self.password)
+
+            pwd.send_keys(Keys.RETURN)
+
+            self.wait.until(lambda d: (
+
+                "Login failed" in d.page_source
+
+                or d.find_elements(By.CSS_SELECTOR, "#gridDiv")
+
+                or d.find_elements(By.TAG_NAME, "iframe")
+
+                or d.find_elements(By.ID, "menuBurger")
+
+            ))
+
+            if "Login failed" in self.driver.page_source:
+
+                self.log("❌ Login failed — invalid credentials", "error")
+
+                return False
+
+            self.log("✅ Login successful")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error during login: {e}", "error")
+
+            self.save_screenshot("login_error")
+
+            return False
+ 
+    def select_branch(self, branch_name: str = "HO") -> bool:
+
+        try:
+
+            found   = False
+
+            iframes = self.wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "iframe")))
+
+            for i, frame in enumerate(iframes):
+
+                self.driver.switch_to.default_content()
+
+                self.driver.switch_to.frame(frame)
+
+                if self.driver.find_elements(By.CSS_SELECTOR, "#gridDiv > div.pq-grid-center"):
+
+                    found = True
+
+                    self.log(f"✅ Branch popup found in iframe {i}")
+
+                    break
+
+            if not found:
+
+                self.driver.switch_to.default_content()
+
+                self.log("⚠️ Branch popup not found", "warning")
+
+                return False
+
+            branch_row = self.wait.until(
+
+                EC.presence_of_element_located((By.XPATH, f"//td[contains(normalize-space(.), '{branch_name}')]"))
+
+            )
+
+            ActionChains(self.driver).double_click(branch_row).perform()
+
+            self.driver.switch_to.default_content()
+
+            self.wait.until(EC.presence_of_element_located((By.ID, "menuBurger")))
+
+            self.log(f"✅ Branch '{branch_name}' selected")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error selecting branch: {e}", "error")
+
+            self.save_screenshot("branch_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def open_menu(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            menu = self.wait.until(EC.element_to_be_clickable((By.ID, "menuBurger")))
+
+            self.driver.execute_script("arguments[0].click();", menu)
+
+            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#cboxLoadedContent")))
+
+            self.log("✅ Menu opened")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Failed to open menu: {e}", "error")
+
+            self.save_screenshot("menu_error")
+
+            return False
+ 
+    def search_and_navigate_to_report(self, report_name: str = "Finsys Prime Reports : Accounts MIS") -> bool:
+
+        try:
+
+            iframe = self.wait.until(
+
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#cboxLoadedContent iframe.cboxIframe"))
+
+            )
+
+            self.driver.switch_to.frame(iframe)
+
+            search_box = self.wait.until(
+
+                EC.presence_of_element_located((By.XPATH, "//input[@type='text' or contains(@id,'txtSearch') or contains(@placeholder,'Search')]"))
+
+            )
+
+            search_box.clear()
+
+            search_box.send_keys(report_name)
+
+            result = WebDriverWait(self.driver, 10).until(
+
+                EC.presence_of_element_located((By.XPATH, f"//td[contains(normalize-space(.), '{report_name}')]"))
+
+            )
+
+            ActionChains(self.driver).double_click(result).perform()
+
+            self.driver.switch_to.default_content()
+
+            try:
+
+                WebDriverWait(self.driver, 5).until_not(
+
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "#cboxLoadedContent iframe.cboxIframe"))
+
+                )
+
+            except TimeoutException:
+
+                self.log("⚠️ Menu didn't close in time, continuing...")
+
+            time.sleep(2)
+
+            self.log(f"✅ '{report_name}' opened")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error navigating to report: {e}", "error")
+
+            self.save_screenshot("report_nav_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def click_debtors_ageing_button(self) -> bool:
+
+        BUTTON_ID = "ContentPlaceHolder1_btn6a"
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(3)
+
+            self.save_screenshot("before_click_debtors_btn")
+ 
+            btn         = None
+
+            all_iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+
+            self.log(f"🔍 Found {len(all_iframes)} iframes on page")
+ 
+            for i, frame in enumerate(all_iframes):
+
+                try:
+
+                    self.driver.switch_to.default_content()
+
+                    self.driver.switch_to.frame(frame)
+
+                    elements = self.driver.find_elements(By.ID, BUTTON_ID)
+
+                    if elements:
+
+                        btn = elements[0]
+
+                        self.log(f"✅ Found Debtors button in iframe {i}")
+
+                        break
+
+                    elements = self.driver.find_elements(
+
+                        By.XPATH,
+
+                        "//input[@type='submit' and contains(@value, 'Debtors')]"
+
+                    )
+
+                    if elements:
+
+                        btn = elements[0]
+
+                        self.log(f"✅ Found Debtors button via text in iframe {i}")
+
+                        break
+
+                except Exception:
+
+                    continue
+ 
+            if not btn:
+
+                self.driver.switch_to.default_content()
+
+                try:
+
+                    btn = WebDriverWait(self.driver, 10).until(
+
+                        EC.presence_of_element_located((By.ID, BUTTON_ID))
+
+                    )
+
+                    self.log("✅ Found Debtors button in default content")
+
+                except TimeoutException:
+
+                    self.log("❌ Debtors button not found anywhere", "error")
+
+                    self.save_screenshot("button_not_found")
+
+                    return False
+ 
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+
+            time.sleep(0.5)
+
+            self.driver.execute_script("arguments[0].click();", btn)
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(2)
+
+            self.log("✅ Debtors Ageing Summary button clicked")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error clicking Debtors button: {e}", "error")
+
+            self.save_screenshot("button_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def handle_payment_terms_popup(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(1)
+
+            self.log("🔍 Looking for 'Consider Payment Terms' popup...")
+ 
+            ok_button = None
+
+            XPATHS = [
+
+                "//input[@value='Ok']",
+
+                "//input[@value='OK']",
+
+                "//input[@type='button' and @value='Ok']",
+
+                "//input[@type='submit' and @value='Ok']",
+
+                "//button[normalize-space(.)='Ok']",
+
+                "//button[normalize-space(.)='OK']",
+
+            ]
+ 
+            for xpath in XPATHS:
+
+                elements = self.driver.find_elements(By.XPATH, xpath)
+
+                if elements:
+
+                    ok_button = elements[0]
+
+                    self.log("✅ Found OK button on main page")
+
+                    break
+ 
+            if not ok_button:
+
+                all_iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+
+                for i, frame in enumerate(all_iframes):
+
+                    try:
+
+                        self.driver.switch_to.default_content()
+
+                        self.driver.switch_to.frame(frame)
+
+                        for xpath in XPATHS:
+
+                            elements = self.driver.find_elements(By.XPATH, xpath)
+
+                            if elements:
+
+                                ok_button = elements[0]
+
+                                self.log(f"✅ Found OK button in iframe {i}")
+
+                                break
+
+                        if ok_button:
+
+                            break
+
+                    except Exception:
+
+                        continue
+
+                else:
+
+                    self.driver.switch_to.default_content()
+ 
+            if not ok_button:
+
+                self.log("⚠️ Payment Terms popup not found — skipping", "warning")
+
+                self.driver.switch_to.default_content()
+
+                return True
+ 
+            try:
+
+                text_inputs = self.driver.find_elements(By.XPATH, "//input[@type='text']")
+
+                if text_inputs:
+
+                    text_inputs[0].clear()
+
+            except Exception:
+
+                pass
+ 
+            self.driver.execute_script("arguments[0].click();", ok_button)
+
+            self.log("✅ Clicked OK on 'Consider Payment Terms' popup")
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(2)
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error handling payment terms popup: {e}", "error")
+
+            self.save_screenshot("payment_terms_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def set_report_period(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(2)
+ 
+            param_iframe = None
+
+            selectors = [
+
+                "#colorbox iframe.cboxIframe",
+
+                "#cboxLoadedContent iframe",
+
+                "iframe.cboxIframe",
+
+                "#colorbox iframe",
+
+            ]
+
+            for selector in selectors:
+
+                try:
+
+                    param_iframe = WebDriverWait(self.driver, 5).until(
+
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+
+                    )
+
+                    self.log(f"✅ Found param iframe via: {selector}")
+
+                    break
+
+                except TimeoutException:
+
+                    continue
+ 
+            if param_iframe:
+
+                self.driver.switch_to.frame(param_iframe)
+
+            else:
+
+                self.driver.switch_to.default_content()
+ 
+            WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+ 
+            try:
+
+                from selenium.webdriver.support.ui import Select
+
+                dropdown    = WebDriverWait(self.driver, 3).until(
+
+                    EC.presence_of_element_located((By.TAG_NAME, "select"))
+
+                )
+
+                select_obj  = Select(dropdown)
+
+                options_text = [o.text for o in select_obj.options]
+
+                self.log(f"📋 Dropdown options: {options_text}")
+
+                for opt in options_text:
+
+                    if "ytd" in opt.lower() or "y.t.d" in opt.lower() or "year" in opt.lower():
+
+                        select_obj.select_by_visible_text(opt)
+
+                        self.log(f"✅ Period set via dropdown: {opt}")
+
+                        self.driver.switch_to.default_content()
+
+                        return True
+
+            except Exception as ex:
+
+                self.log(f"ℹ️ No dropdown found: {ex}")
+ 
+            radios = self.driver.find_elements(By.CSS_SELECTOR, "input[type='radio']")
+
+            self.log(f"🔍 Found {len(radios)} radio buttons")
+
+            for radio in radios:
+
+                val        = (radio.get_attribute("value") or "").lower()
+
+                rid        = (radio.get_attribute("id") or "").lower()
+
+                label_text = ""
+
+                try:
+
+                    label = self.driver.find_element(
+
+                        By.XPATH, f"//label[@for='{radio.get_attribute('id')}']"
+
+                    )
+
+                    label_text = label.text.lower()
+
+                except Exception:
+
+                    pass
+
+                if any(kw in val or kw in rid or kw in label_text for kw in ["ytd", "y.t.d", "year"]):
+
+                    self.driver.execute_script("arguments[0].click();", radio)
+
+                    self.log(f"✅ YTD radio selected (value={val})")
+
+                    self.driver.switch_to.default_content()
+
+                    return True
+ 
+            try:
+
+                ytd_label = WebDriverWait(self.driver, 3).until(
+
+                    EC.presence_of_element_located(
+
+                        (By.XPATH, "//label[contains(text(), 'Y.T.D') or contains(text(), 'Year To Date')]")
+
+                    )
+
+                )
+
+                self.driver.execute_script("arguments[0].click();", ytd_label)
+
+                self.log("✅ YTD selected via label click")
+
+                self.driver.switch_to.default_content()
+
+                return True
+
+            except Exception:
+
+                pass
+ 
+            self.log("❌ Could not find YTD option", "error")
+
+            self.save_screenshot("period_not_found")
+
+            self.driver.switch_to.default_content()
+
+            return False
+
+        except Exception as e:
+
+            self.log(f"❌ Error setting period: {e}", "error")
+
+            self.save_screenshot("period_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def submit_report_parameters(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            param_iframe = None
+
+            selectors = [
+
+                "#colorbox iframe.cboxIframe",
+
+                "#cboxLoadedContent iframe",
+
+                "iframe.cboxIframe",
+
+                "#colorbox iframe",
+
+            ]
+
+            for selector in selectors:
+
+                try:
+
+                    param_iframe = WebDriverWait(self.driver, 5).until(
+
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+
+                    )
+
+                    break
+
+                except TimeoutException:
+
+                    continue
+
+            if param_iframe:
+
+                self.driver.switch_to.frame(param_iframe)
+
+            submit = WebDriverWait(self.driver, 20).until(
+
+                EC.element_to_be_clickable((By.ID, "btnsubmit"))
+
+            )
+
+            self.driver.execute_script("arguments[0].scrollIntoView(true);", submit)
+
+            time.sleep(0.2)
+
+            self.driver.execute_script("arguments[0].click();", submit)
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(1)
+
+            self.log("✅ Report parameters submitted")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Submit error: {e}", "error")
+
+            self.save_screenshot("submit_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def _find_and_rename_downloaded_file(self, existing_files: set) -> Optional[Path]:
+
+        try:
+
+            time.sleep(1)
+
+            new_files = set(self.DOWNLOAD_DIR.glob("*.csv")) - existing_files
+
+            if not new_files:
+
+                self.log("⚠️ No new CSV file detected", "warning")
+
+                return None
+
+            downloaded   = max(new_files, key=lambda f: f.stat().st_mtime)
+
+            new_filepath = self.DOWNLOAD_DIR / "Debtors_Ageing_Summary_Report_YTD.csv"
+
+            if new_filepath.exists():
+
+                new_filepath.unlink()
+
+            downloaded.rename(new_filepath)
+
+            self.log(f"✅ File renamed to: {new_filepath.name}")
+
+            return new_filepath
+
+        except Exception as e:
+
+            self.log(f"⚠️ Error renaming file: {e}", "warning")
+
+            return None
+ 
+    def export_report_to_csv(self) -> bool:
+
+        self.driver.switch_to.default_content()
+
+        try:
+
+            existing_files = set(self.DOWNLOAD_DIR.glob("*.csv"))
+
+            self.log(f"📁 Tracking {len(existing_files)} existing CSV files")
+
+            report_iframe = self.wait.until(
+
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#colorbox iframe.cboxIframe"))
+
+            )
+
+            self.driver.switch_to.frame(report_iframe)
+
+            WebDriverWait(self.driver, 30).until(
+
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".pq-toolbar"))
+
+            )
+
+            self.log("✅ Report toolbar detected")
+
+            WebDriverWait(self.driver, 5).until(
+
+                EC.presence_of_element_located((By.ID, "export_format"))
+
+            )
+
+            self.driver.execute_script("document.getElementById('export_format').value = 'csv';")
+
+            self.driver.execute_script("document.getElementById('export_format').dispatchEvent(new Event('change'));")
+
+            self.log("✅ Export format set to CSV")
+
+            export_btn = WebDriverWait(self.driver, 5).until(
+
+                EC.element_to_be_clickable((By.CSS_SELECTOR,
+
+                    "#gridDiv > div.pq-grid-top.ui-widget-header.ui-corner-top > div.pq-toolbar > button"))
+
+            )
+
+            self.driver.execute_script("arguments[0].click();", export_btn)
+
+            self.log("✅ Export button clicked, waiting for download...")
+
+            time.sleep(20)
+
+            self.driver.switch_to.default_content()
+
+            new_file = self._find_and_rename_downloaded_file(existing_files)
+
+            if new_file:
+
+                self.log(f"🎉 Report downloaded successfully! → {new_file}")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Export error: {e}", "error")
+
+            self.save_screenshot("export_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def _write_final_status(self, success: bool, error_message: str = ""):
+
+        runtime   = round(time.time() - self.start_time, 2)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        status    = (
+
+            f"[{timestamp}] SUCCESS: Completed in {runtime}s."
+
+            if success else
+
+            f"[{timestamp}] FAILED after {runtime}s. Error: "
+
+            f"{error_message.splitlines()[0].strip() if error_message else 'Unknown error.'}"
+
+        )
+
+        try:
+
+            self._log_file.parent.mkdir(parents=True, exist_ok=True)
+
+            os.system(f"chmod -R 777 {self._log_file.parent}")
+
+            with open(self._log_file, "w", encoding="utf-8") as f:
+
+                f.write(status + "\n")
+
+            self.logger.info(f"✅ Status written to: {self._log_file}")
+
+        except Exception as e:
+
+            self.logger.error(f"❌ Failed to write status: {e}")
+ 
+    def run(self):
+
+        success         = False
+
+        final_exception = ""
+
+        try:
+
+            self.initialize_driver()
+
+            if not self.login():
+
+                raise Exception("Login failed.")
+
+            if not self.select_branch():
+
+                raise Exception("Branch selection failed.")
+
+            if not self.open_menu():
+
+                raise Exception("Menu access failed.")
+
+            if not self.search_and_navigate_to_report():
+
+                raise Exception("Failed to open Accounts MIS.")
+
+            if not self.click_debtors_ageing_button():
+
+                raise Exception("Failed to click Debtors Ageing Summary button.")
+
+            if not self.handle_payment_terms_popup():
+
+                raise Exception("Failed to handle Payment Terms popup.")
+
+            if not self.set_report_period():
+
+                raise Exception("Failed to set period to Y.T.D.")
+
+            if not self.submit_report_parameters():
+
+                raise Exception("Submit failed.")
+
+            if not self.export_report_to_csv():
+
+                raise Exception("Export failed.")
+
+            self.log("🎉 Automation completed successfully!")
+
+            success = True
+
+        except Exception as e:
+
+            self.log(f"❌ Automation failed: {e}", "error")
+
+            final_exception = str(e)
+
+        finally:
+
+            self._write_final_status(success, final_exception)
+
+            self.cleanup()
+ 
+    def cleanup(self):
+
+        if self.driver:
+
+            try:
+
+                self.driver.quit()
+
+                self.log("✅ Browser closed.")
+
+            except Exception as e:
+
+                self.log(f"⚠️ Cleanup error: {e}", "warning")
+ 
+ 
+def main():
+
+    automation = ERPAutomation(
+
+        username="M.Shehata",
+
+        password="mostafa@1234",
+
+        headless=True,
+
+    )
+
+    try:
+
+        automation.run()
+
+    except KeyboardInterrupt:
+
+        print("\n⚠️ Interrupted by user")
+
+    except Exception:
+
+        pass
+ 
+ 
+if __name__ == "__main__":
+
+    main()
+ 
+from selenium import webdriver
+
+from selenium.webdriver.chrome.service import Service
+
+from selenium.webdriver.chrome.options import Options
+
+from selenium.webdriver.common.by import By
+
+from selenium.webdriver.common.keys import Keys
+
+from selenium.webdriver.support.ui import WebDriverWait
+
+from selenium.webdriver.support import expected_conditions as EC
+
+from selenium.webdriver.common.action_chains import ActionChains
+
+from selenium.common.exceptions import TimeoutException
+
+import time
+
+import os
+
+from datetime import datetime
+
+from pathlib import Path
+
+from typing import Optional
+
+import logging
+ 
+ 
+class ERPAutomation:
+
+    """Automated ERP system interaction for Debtors Ageing Summary Report (YTD)."""
+ 
+    DOWNLOAD_DIR   = Path("/opt/airflow/data")
+
+    SCREENSHOT_DIR = Path("/opt/airflow/data/screenshots")
+ 
+    def __init__(self, username: str, password: str, headless: bool = True):
+
+        self.username   = username
+
+        self.password   = password
+
+        self.headless   = headless
+
+        self.login_url  = "https://sgerp.salmangroup.com/login.aspx"
+
+        self.driver: Optional[webdriver.Chrome] = None
+
+        self.wait:   Optional[WebDriverWait]    = None
+
+        self.start_time = time.time()
+
+        self._log_file  = Path("/opt/airflow/data/Debtors_Ageing_YTD_Automation.txt")
+
+        self._fix_permissions()
+
+        self._setup_logging()
+ 
+    def _fix_permissions(self):
+
+        try:
+
+            self.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+            self.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+            os.system(f"chmod -R 777 {self.DOWNLOAD_DIR}")
+
+            os.system(f"chmod -R 777 {self.SCREENSHOT_DIR}")
+
+        except Exception as e:
+
+            print(f"WARNING: Could not fix permissions: {e}")
+ 
+    def _setup_logging(self):
+
+        formatter = logging.Formatter(
+
+            '%(asctime)s [%(levelname)s] %(message)s',
+
+            datefmt='%Y-%m-%d %H:%M:%S'
+
+        )
+
+        console_handler = logging.StreamHandler()
+
+        console_handler.setFormatter(formatter)
+
+        self.logger = logging.getLogger(__name__)
+
+        self.logger.setLevel(logging.INFO)
+
+        if not self.logger.handlers:
+
+            self.logger.addHandler(console_handler)
+ 
+    def _elapsed_time(self) -> str:
+
+        return f"(⏱ {time.time() - self.start_time:.2f}s)"
+ 
+    def log(self, message: str, level: str = "info"):
+
+        getattr(self.logger, level)(f"{message} {self._elapsed_time()}")
+ 
+    def save_screenshot(self, name: str):
+
+        try:
+
+            filepath = self.SCREENSHOT_DIR / f"screenshot_{name}_{int(time.time())}.png"
+
+            self.driver.save_screenshot(str(filepath))
+
+            self.log(f"📸 Screenshot saved: {filepath}")
+
+        except Exception as e:
+
+            self.log(f"⚠️ Failed to save screenshot: {e}", "warning")
+ 
+    def initialize_driver(self):
+
+        try:
+
+            options = Options()
+
+            if self.headless:
+
+                options.add_argument("--headless=new")
+
+                options.add_argument("--window-size=1920,1080")
+
+            else:
+
+                options.add_argument("--start-maximized")
+
+            options.add_argument("--disable-gpu")
+
+            options.add_argument("--no-sandbox")
+
+            options.add_argument("--disable-dev-shm-usage")
+
+            options.add_argument("--disable-extensions")
+
+            options.add_argument("--disable-popup-blocking")
+
+            download_path = str(self.DOWNLOAD_DIR.resolve())
+
+            options.add_experimental_option("prefs", {
+
+                "download.default_directory": download_path,
+
+                "download.prompt_for_download": False,
+
+                "download.directory_upgrade": True,
+
+                "safebrowsing.enabled": True,
+
+                "plugins.always_open_pdf_externally": True,
+
+            })
+
+            service = Service("/usr/local/bin/chromedriver")
+
+            self.driver = webdriver.Chrome(service=service, options=options)
+
+            self.wait   = WebDriverWait(self.driver, 15)
+
+            self.log(f"✅ WebDriver initialized. Download path: {download_path}")
+
+        except Exception as e:
+
+            self.log(f"❌ Failed to initialize WebDriver: {e}", "error")
+
+            raise
+ 
+    def login(self) -> bool:
+
+        try:
+
+            self.driver.get(self.login_url)
+
+            self.wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "input")))
+
+            self.driver.find_element(By.XPATH, "//input[@placeholder='User Name']").send_keys(self.username)
+
+            pwd = self.driver.find_element(By.XPATH, "//input[@placeholder='Password']")
+
+            pwd.send_keys(self.password)
+
+            pwd.send_keys(Keys.RETURN)
+
+            self.wait.until(lambda d: (
+
+                "Login failed" in d.page_source
+
+                or d.find_elements(By.CSS_SELECTOR, "#gridDiv")
+
+                or d.find_elements(By.TAG_NAME, "iframe")
+
+                or d.find_elements(By.ID, "menuBurger")
+
+            ))
+
+            if "Login failed" in self.driver.page_source:
+
+                self.log("❌ Login failed — invalid credentials", "error")
+
+                return False
+
+            self.log("✅ Login successful")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error during login: {e}", "error")
+
+            self.save_screenshot("login_error")
+
+            return False
+ 
+    def select_branch(self, branch_name: str = "HO") -> bool:
+
+        try:
+
+            found   = False
+
+            iframes = self.wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "iframe")))
+
+            for i, frame in enumerate(iframes):
+
+                self.driver.switch_to.default_content()
+
+                self.driver.switch_to.frame(frame)
+
+                if self.driver.find_elements(By.CSS_SELECTOR, "#gridDiv > div.pq-grid-center"):
+
+                    found = True
+
+                    self.log(f"✅ Branch popup found in iframe {i}")
+
+                    break
+
+            if not found:
+
+                self.driver.switch_to.default_content()
+
+                self.log("⚠️ Branch popup not found", "warning")
+
+                return False
+
+            branch_row = self.wait.until(
+
+                EC.presence_of_element_located((By.XPATH, f"//td[contains(normalize-space(.), '{branch_name}')]"))
+
+            )
+
+            ActionChains(self.driver).double_click(branch_row).perform()
+
+            self.driver.switch_to.default_content()
+
+            self.wait.until(EC.presence_of_element_located((By.ID, "menuBurger")))
+
+            self.log(f"✅ Branch '{branch_name}' selected")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error selecting branch: {e}", "error")
+
+            self.save_screenshot("branch_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def open_menu(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            menu = self.wait.until(EC.element_to_be_clickable((By.ID, "menuBurger")))
+
+            self.driver.execute_script("arguments[0].click();", menu)
+
+            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#cboxLoadedContent")))
+
+            self.log("✅ Menu opened")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Failed to open menu: {e}", "error")
+
+            self.save_screenshot("menu_error")
+
+            return False
+ 
+    def search_and_navigate_to_report(self, report_name: str = "Finsys Prime Reports : Accounts MIS") -> bool:
+
+        try:
+
+            iframe = self.wait.until(
+
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#cboxLoadedContent iframe.cboxIframe"))
+
+            )
+
+            self.driver.switch_to.frame(iframe)
+
+            search_box = self.wait.until(
+
+                EC.presence_of_element_located((By.XPATH, "//input[@type='text' or contains(@id,'txtSearch') or contains(@placeholder,'Search')]"))
+
+            )
+
+            search_box.clear()
+
+            search_box.send_keys(report_name)
+
+            result = WebDriverWait(self.driver, 10).until(
+
+                EC.presence_of_element_located((By.XPATH, f"//td[contains(normalize-space(.), '{report_name}')]"))
+
+            )
+
+            ActionChains(self.driver).double_click(result).perform()
+
+            self.driver.switch_to.default_content()
+
+            try:
+
+                WebDriverWait(self.driver, 5).until_not(
+
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "#cboxLoadedContent iframe.cboxIframe"))
+
+                )
+
+            except TimeoutException:
+
+                self.log("⚠️ Menu didn't close in time, continuing...")
+
+            time.sleep(2)
+
+            self.log(f"✅ '{report_name}' opened")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error navigating to report: {e}", "error")
+
+            self.save_screenshot("report_nav_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def click_debtors_ageing_button(self) -> bool:
+
+        BUTTON_ID = "ContentPlaceHolder1_btn6a"
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(3)
+
+            self.save_screenshot("before_click_debtors_btn")
+ 
+            btn         = None
+
+            all_iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+
+            self.log(f"🔍 Found {len(all_iframes)} iframes on page")
+ 
+            for i, frame in enumerate(all_iframes):
+
+                try:
+
+                    self.driver.switch_to.default_content()
+
+                    self.driver.switch_to.frame(frame)
+
+                    elements = self.driver.find_elements(By.ID, BUTTON_ID)
+
+                    if elements:
+
+                        btn = elements[0]
+
+                        self.log(f"✅ Found Debtors button in iframe {i}")
+
+                        break
+
+                    elements = self.driver.find_elements(
+
+                        By.XPATH,
+
+                        "//input[@type='submit' and contains(@value, 'Debtors')]"
+
+                    )
+
+                    if elements:
+
+                        btn = elements[0]
+
+                        self.log(f"✅ Found Debtors button via text in iframe {i}")
+
+                        break
+
+                except Exception:
+
+                    continue
+ 
+            if not btn:
+
+                self.driver.switch_to.default_content()
+
+                try:
+
+                    btn = WebDriverWait(self.driver, 10).until(
+
+                        EC.presence_of_element_located((By.ID, BUTTON_ID))
+
+                    )
+
+                    self.log("✅ Found Debtors button in default content")
+
+                except TimeoutException:
+
+                    self.log("❌ Debtors button not found anywhere", "error")
+
+                    self.save_screenshot("button_not_found")
+
+                    return False
+ 
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+
+            time.sleep(0.5)
+
+            self.driver.execute_script("arguments[0].click();", btn)
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(2)
+
+            self.log("✅ Debtors Ageing Summary button clicked")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error clicking Debtors button: {e}", "error")
+
+            self.save_screenshot("button_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def handle_payment_terms_popup(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(1)
+
+            self.log("🔍 Looking for 'Consider Payment Terms' popup...")
+ 
+            ok_button = None
+
+            XPATHS = [
+
+                "//input[@value='Ok']",
+
+                "//input[@value='OK']",
+
+                "//input[@type='button' and @value='Ok']",
+
+                "//input[@type='submit' and @value='Ok']",
+
+                "//button[normalize-space(.)='Ok']",
+
+                "//button[normalize-space(.)='OK']",
+
+            ]
+ 
+            for xpath in XPATHS:
+
+                elements = self.driver.find_elements(By.XPATH, xpath)
+
+                if elements:
+
+                    ok_button = elements[0]
+
+                    self.log("✅ Found OK button on main page")
+
+                    break
+ 
+            if not ok_button:
+
+                all_iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+
+                for i, frame in enumerate(all_iframes):
+
+                    try:
+
+                        self.driver.switch_to.default_content()
+
+                        self.driver.switch_to.frame(frame)
+
+                        for xpath in XPATHS:
+
+                            elements = self.driver.find_elements(By.XPATH, xpath)
+
+                            if elements:
+
+                                ok_button = elements[0]
+
+                                self.log(f"✅ Found OK button in iframe {i}")
+
+                                break
+
+                        if ok_button:
+
+                            break
+
+                    except Exception:
+
+                        continue
+
+                else:
+
+                    self.driver.switch_to.default_content()
+ 
+            if not ok_button:
+
+                self.log("⚠️ Payment Terms popup not found — skipping", "warning")
+
+                self.driver.switch_to.default_content()
+
+                return True
+ 
+            try:
+
+                text_inputs = self.driver.find_elements(By.XPATH, "//input[@type='text']")
+
+                if text_inputs:
+
+                    text_inputs[0].clear()
+
+            except Exception:
+
+                pass
+ 
+            self.driver.execute_script("arguments[0].click();", ok_button)
+
+            self.log("✅ Clicked OK on 'Consider Payment Terms' popup")
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(2)
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Error handling payment terms popup: {e}", "error")
+
+            self.save_screenshot("payment_terms_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def set_report_period(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(2)
+ 
+            param_iframe = None
+
+            selectors = [
+
+                "#colorbox iframe.cboxIframe",
+
+                "#cboxLoadedContent iframe",
+
+                "iframe.cboxIframe",
+
+                "#colorbox iframe",
+
+            ]
+
+            for selector in selectors:
+
+                try:
+
+                    param_iframe = WebDriverWait(self.driver, 5).until(
+
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+
+                    )
+
+                    self.log(f"✅ Found param iframe via: {selector}")
+
+                    break
+
+                except TimeoutException:
+
+                    continue
+ 
+            if param_iframe:
+
+                self.driver.switch_to.frame(param_iframe)
+
+            else:
+
+                self.driver.switch_to.default_content()
+ 
+            WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+ 
+            try:
+
+                from selenium.webdriver.support.ui import Select
+
+                dropdown    = WebDriverWait(self.driver, 3).until(
+
+                    EC.presence_of_element_located((By.TAG_NAME, "select"))
+
+                )
+
+                select_obj  = Select(dropdown)
+
+                options_text = [o.text for o in select_obj.options]
+
+                self.log(f"📋 Dropdown options: {options_text}")
+
+                for opt in options_text:
+
+                    if "ytd" in opt.lower() or "y.t.d" in opt.lower() or "year" in opt.lower():
+
+                        select_obj.select_by_visible_text(opt)
+
+                        self.log(f"✅ Period set via dropdown: {opt}")
+
+                        self.driver.switch_to.default_content()
+
+                        return True
+
+            except Exception as ex:
+
+                self.log(f"ℹ️ No dropdown found: {ex}")
+ 
+            radios = self.driver.find_elements(By.CSS_SELECTOR, "input[type='radio']")
+
+            self.log(f"🔍 Found {len(radios)} radio buttons")
+
+            for radio in radios:
+
+                val        = (radio.get_attribute("value") or "").lower()
+
+                rid        = (radio.get_attribute("id") or "").lower()
+
+                label_text = ""
+
+                try:
+
+                    label = self.driver.find_element(
+
+                        By.XPATH, f"//label[@for='{radio.get_attribute('id')}']"
+
+                    )
+
+                    label_text = label.text.lower()
+
+                except Exception:
+
+                    pass
+
+                if any(kw in val or kw in rid or kw in label_text for kw in ["ytd", "y.t.d", "year"]):
+
+                    self.driver.execute_script("arguments[0].click();", radio)
+
+                    self.log(f"✅ YTD radio selected (value={val})")
+
+                    self.driver.switch_to.default_content()
+
+                    return True
+ 
+            try:
+
+                ytd_label = WebDriverWait(self.driver, 3).until(
+
+                    EC.presence_of_element_located(
+
+                        (By.XPATH, "//label[contains(text(), 'Y.T.D') or contains(text(), 'Year To Date')]")
+
+                    )
+
+                )
+
+                self.driver.execute_script("arguments[0].click();", ytd_label)
+
+                self.log("✅ YTD selected via label click")
+
+                self.driver.switch_to.default_content()
+
+                return True
+
+            except Exception:
+
+                pass
+ 
+            self.log("❌ Could not find YTD option", "error")
+
+            self.save_screenshot("period_not_found")
+
+            self.driver.switch_to.default_content()
+
+            return False
+
+        except Exception as e:
+
+            self.log(f"❌ Error setting period: {e}", "error")
+
+            self.save_screenshot("period_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def submit_report_parameters(self) -> bool:
+
+        try:
+
+            self.driver.switch_to.default_content()
+
+            param_iframe = None
+
+            selectors = [
+
+                "#colorbox iframe.cboxIframe",
+
+                "#cboxLoadedContent iframe",
+
+                "iframe.cboxIframe",
+
+                "#colorbox iframe",
+
+            ]
+
+            for selector in selectors:
+
+                try:
+
+                    param_iframe = WebDriverWait(self.driver, 5).until(
+
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+
+                    )
+
+                    break
+
+                except TimeoutException:
+
+                    continue
+
+            if param_iframe:
+
+                self.driver.switch_to.frame(param_iframe)
+
+            submit = WebDriverWait(self.driver, 20).until(
+
+                EC.element_to_be_clickable((By.ID, "btnsubmit"))
+
+            )
+
+            self.driver.execute_script("arguments[0].scrollIntoView(true);", submit)
+
+            time.sleep(0.2)
+
+            self.driver.execute_script("arguments[0].click();", submit)
+
+            self.driver.switch_to.default_content()
+
+            time.sleep(1)
+
+            self.log("✅ Report parameters submitted")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Submit error: {e}", "error")
+
+            self.save_screenshot("submit_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def _find_and_rename_downloaded_file(self, existing_files: set) -> Optional[Path]:
+
+        try:
+
+            time.sleep(1)
+
+            new_files = set(self.DOWNLOAD_DIR.glob("*.csv")) - existing_files
+
+            if not new_files:
+
+                self.log("⚠️ No new CSV file detected", "warning")
+
+                return None
+
+            downloaded   = max(new_files, key=lambda f: f.stat().st_mtime)
+
+            new_filepath = self.DOWNLOAD_DIR / "Debtors_Ageing_Summary_Report_YTD.csv"
+
+            if new_filepath.exists():
+
+                new_filepath.unlink()
+
+            downloaded.rename(new_filepath)
+
+            self.log(f"✅ File renamed to: {new_filepath.name}")
+
+            return new_filepath
+
+        except Exception as e:
+
+            self.log(f"⚠️ Error renaming file: {e}", "warning")
+
+            return None
+ 
+    def export_report_to_csv(self) -> bool:
+
+        self.driver.switch_to.default_content()
+
+        try:
+
+            existing_files = set(self.DOWNLOAD_DIR.glob("*.csv"))
+
+            self.log(f"📁 Tracking {len(existing_files)} existing CSV files")
+
+            report_iframe = self.wait.until(
+
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#colorbox iframe.cboxIframe"))
+
+            )
+
+            self.driver.switch_to.frame(report_iframe)
+
+            WebDriverWait(self.driver, 30).until(
+
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".pq-toolbar"))
+
+            )
+
+            self.log("✅ Report toolbar detected")
+
+            WebDriverWait(self.driver, 5).until(
+
+                EC.presence_of_element_located((By.ID, "export_format"))
+
+            )
+
+            self.driver.execute_script("document.getElementById('export_format').value = 'csv';")
+
+            self.driver.execute_script("document.getElementById('export_format').dispatchEvent(new Event('change'));")
+
+            self.log("✅ Export format set to CSV")
+
+            export_btn = WebDriverWait(self.driver, 5).until(
+
+                EC.element_to_be_clickable((By.CSS_SELECTOR,
+
+                    "#gridDiv > div.pq-grid-top.ui-widget-header.ui-corner-top > div.pq-toolbar > button"))
+
+            )
+
+            self.driver.execute_script("arguments[0].click();", export_btn)
+
+            self.log("✅ Export button clicked, waiting for download...")
+
+            time.sleep(20)
+
+            self.driver.switch_to.default_content()
+
+            new_file = self._find_and_rename_downloaded_file(existing_files)
+
+            if new_file:
+
+                self.log(f"🎉 Report downloaded successfully! → {new_file}")
+
+            return True
+
+        except Exception as e:
+
+            self.log(f"❌ Export error: {e}", "error")
+
+            self.save_screenshot("export_error")
+
+            self.driver.switch_to.default_content()
+
+            return False
+ 
+    def _write_final_status(self, success: bool, error_message: str = ""):
+
+        runtime   = round(time.time() - self.start_time, 2)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        status    = (
+
+            f"[{timestamp}] SUCCESS: Completed in {runtime}s."
+
+            if success else
+
+            f"[{timestamp}] FAILED after {runtime}s. Error: "
+
+            f"{error_message.splitlines()[0].strip() if error_message else 'Unknown error.'}"
+
+        )
+
+        try:
+
+            self._log_file.parent.mkdir(parents=True, exist_ok=True)
+
+            os.system(f"chmod -R 777 {self._log_file.parent}")
+
+            with open(self._log_file, "w", encoding="utf-8") as f:
+
+                f.write(status + "\n")
+
+            self.logger.info(f"✅ Status written to: {self._log_file}")
+
+        except Exception as e:
+
+            self.logger.error(f"❌ Failed to write status: {e}")
+ 
+    def run(self):
+
+        success         = False
+
+        final_exception = ""
+
+        try:
+
+            self.initialize_driver()
+
+            if not self.login():
+
+                raise Exception("Login failed.")
+
+            if not self.select_branch():
+
+                raise Exception("Branch selection failed.")
+
+            if not self.open_menu():
+
+                raise Exception("Menu access failed.")
+
+            if not self.search_and_navigate_to_report():
+
+                raise Exception("Failed to open Accounts MIS.")
+
+            if not self.click_debtors_ageing_button():
+
+                raise Exception("Failed to click Debtors Ageing Summary button.")
+
+            if not self.handle_payment_terms_popup():
+
+                raise Exception("Failed to handle Payment Terms popup.")
+
+            if not self.set_report_period():
+
+                raise Exception("Failed to set period to Y.T.D.")
+
+            if not self.submit_report_parameters():
+
+                raise Exception("Submit failed.")
+
+            if not self.export_report_to_csv():
+
+                raise Exception("Export failed.")
+
+            self.log("🎉 Automation completed successfully!")
+
+            success = True
+
+        except Exception as e:
+
+            self.log(f"❌ Automation failed: {e}", "error")
+
+            final_exception = str(e)
+
+        finally:
+
+            self._write_final_status(success, final_exception)
+
+            self.cleanup()
+ 
+    def cleanup(self):
+
+        if self.driver:
+
+            try:
+
+                self.driver.quit()
+
+                self.log("✅ Browser closed.")
+
+            except Exception as e:
+
+                self.log(f"⚠️ Cleanup error: {e}", "warning")
+ 
+ 
+def main():
+
+    automation = ERPAutomation(
+
+        username="M.S",
+
+        password="M.s",
+
+        headless=True,
+
+    )
+
+    try:
+
+        automation.run()
+
+    except KeyboardInterrupt:
+
+        print("\n⚠️ Interrupted by user")
+
+    except Exception:
+
+        pass
+ 
+ 
+if __name__ == "__main__":
+
+    main()
+ 

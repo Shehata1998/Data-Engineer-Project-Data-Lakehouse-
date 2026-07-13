@@ -1,0 +1,97 @@
+"""
+Download Item_Master_Report.csv from Google Sheets
+────────────────────────────────────────────────────
+- Exports Google Sheet as CSV and downloads it
+- If file already exists → delete it first then re-download
+- No API key needed (public shared sheet)
+"""
+ 
+import os
+import logging
+import requests
+from pathlib import Path
+ 
+log = logging.getLogger(__name__)
+ 
+GOOGLE_SHEET_ID  = "1xW2byCpe46aan79S7YcY6BSKR7QGXzGJlJGKD66vJj0"
+ITEM_MASTER_PATH = "/opt/airflow/data/Item_Master_Report.csv"
+ 
+EXPORT_URLS = [
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv",
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid=0",
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/pub?output=csv",
+]
+ 
+ 
+def download_item_master() -> str:
+ 
+    log.info("🔄 Downloading Item_Master_Report.csv from Google Sheets ...")
+ 
+    Path("/opt/airflow/data").mkdir(parents=True, exist_ok=True)
+    os.system("chmod -R 777 /opt/airflow/data")
+    log.info("🔑 Permissions fixed on /opt/airflow/data")
+ 
+    if Path(ITEM_MASTER_PATH).exists():
+        Path(ITEM_MASTER_PATH).unlink()
+        log.info("🗑️  Old file removed → downloading latest version")
+ 
+    last_error = None
+ 
+    for i, url in enumerate(EXPORT_URLS, 1):
+        log.info(f"🔗 Attempt {i}/{len(EXPORT_URLS)}: {url}")
+        try:
+            response = requests.get(url, stream=True, timeout=60, allow_redirects=True)
+ 
+            if response.status_code != 200:
+                last_error = f"Status code: {response.status_code}"
+                log.warning(f"   ⚠️  Failed with {last_error} — trying next URL")
+                continue
+ 
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" in content_type:
+                last_error = "Google returned HTML instead of CSV (sheet may not be public)"
+                log.warning(f"   ⚠️  {last_error} — trying next URL")
+                continue
+ 
+            with open(ITEM_MASTER_PATH, "wb") as f:
+                for chunk in response.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
+ 
+            file_size = Path(ITEM_MASTER_PATH).stat().st_size
+            if file_size < 100:
+                last_error = f"Downloaded file too small ({file_size} bytes) — likely not CSV"
+                log.warning(f"   ⚠️  {last_error} — trying next URL")
+                Path(ITEM_MASTER_PATH).unlink(missing_ok=True)
+                continue
+ 
+            with open(ITEM_MASTER_PATH, "r", encoding="utf-8-sig", errors="replace") as f:
+                first_line = f.readline(500)
+            if first_line.strip().lower().startswith("<!doctype") or "<html" in first_line.lower():
+                last_error = "File content is HTML, not CSV"
+                log.warning(f"   ⚠️  {last_error} — trying next URL")
+                Path(ITEM_MASTER_PATH).unlink(missing_ok=True)
+                continue
+ 
+            os.system(f"chmod 777 {ITEM_MASTER_PATH}")
+            log.info(f"✅ Item_Master_Report.csv downloaded successfully")
+            log.info(f"📦 File size: {file_size:,} bytes")
+            log.info(f"📁 Path: {ITEM_MASTER_PATH}")
+            return ITEM_MASTER_PATH
+ 
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            log.warning(f"   ⚠️  Request error: {last_error} — trying next URL")
+            continue
+ 
+    raise ConnectionError(
+        f"❌ Failed to download Item_Master_Report.csv after {len(EXPORT_URLS)} attempts.\n"
+        f"   Last error: {last_error}\n"
+        f"   تأكد إن الـ Google Sheet sharing مضبوط على 'Anyone with the link can view'.\n"
+        f"   Sheet URL: https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit"
+    )
+ 
+ 
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    download_item_master()
